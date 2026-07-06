@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api/index.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/v1/cron/reverify-links",
+      "schedule": "0 4 1 * *"
+    }
+  ]
+}

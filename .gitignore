@@ -1,0 +1,37 @@
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Dependency directories
+node_modules/
+
+# Build output
+dist/
+build/
+out/
+
+# Logs and runtime files
+logs/
+*.log
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+.venv-clean/
+
+*.env
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.code-workspace
+
+# Temporary files
+*.swp
+*.swo
+*.tmp
