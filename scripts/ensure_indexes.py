@@ -9,9 +9,10 @@ Or, if you have a local Mongo instance configured in .env:
 
     python scripts/ensure_indexes.py
 
-The index definitions live in app/db/indexes.py and are also called
-automatically on every app startup (main.py lifespan hook), so this
-script is mainly for one-off Atlas bootstrapping or CI pre-flight checks.
+The index definitions live in app/db/indexes.py and are intended to be
+invoked manually via this script for one-off Atlas bootstrapping or CI
+pre-flight checks. This script does not rely on any automatic startup
+behavior in the application.
 """
 import asyncio
 import logging

@@ -1,9 +1,10 @@
 """
-app/db/indexes.py — MongoDB index creation, called from main.py lifespan.
+app/db/indexes.py — MongoDB index creation helpers.
 
-The actual index definitions live here so they can be called on startup
-(ensuring a warm Vercel instance always has indexes) and also run
-standalone via scripts/ensure_indexes.py against Atlas before go-live.
+This module contains the index definitions and the `ensure_indexes()`
+helper. It is NOT invoked automatically on application startup; it is
+intended to be run manually via `scripts/ensure_indexes.py` when you
+need to bootstrap or verify indexes on a MongoDB/Atlas cluster.
 """
 import logging
 
