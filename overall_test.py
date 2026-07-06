@@ -162,3 +162,10 @@
 #
 #
 # app = create_app()
+
+# --- RECENT COMMAND OUTPUTS (git log --oneline and ensure_indexes run) ---
+# 6b5cb13 (HEAD -> main) docs: remove false claims of automatic index creation on startup
+# 6f037af docs: remove false claims of automatic index creation on startup
+# f12b3dd (origin/main) fix: restore lifespan-only startup/shutdown, remove eager index creation and deprecated on_event handler
+# d456d30 first commit
+# INFO neuro_platform.db.indexes: MongoDB indexes verified/created on collection=datasets
