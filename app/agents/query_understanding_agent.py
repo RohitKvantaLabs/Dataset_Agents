@@ -1,5 +1,8 @@
 import logging
 
+import requests.exceptions
+from huggingface_hub.errors import HfHubHTTPError, InferenceTimeoutError
+
 from app.config import get_settings
 from app.llm.client import LLMClient, LLMJSONParseError
 from app.llm.prompts import QUERY_UNDERSTANDING_SYSTEM_PROMPT, query_understanding_user_prompt
@@ -46,6 +49,18 @@ class QueryUnderstandingAgent:
         except (LLMJSONParseError, TypeError, ValueError) as exc:
             logger.warning("Query parsing fell back to heuristic mode: %s", exc)
             return self._heuristic_parse(raw_query)
+        except (
+            HfHubHTTPError,
+            InferenceTimeoutError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            logger.warning(
+                "Query parsing fell back to keyword-only filters due to NETWORK failure "
+                "(LLM endpoint unreachable — not a malformed-response error): %s",
+                exc,
+            )
+            return QueryFilters(raw_query=raw_query, keywords=raw_query.split())
 
     def _heuristic_parse(self, raw_query: str) -> QueryFilters:
         text = raw_query.lower()

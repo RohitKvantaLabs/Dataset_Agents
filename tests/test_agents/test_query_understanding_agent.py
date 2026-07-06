@@ -4,13 +4,19 @@ Tests for QueryUnderstandingAgent.
 Covers (per CLAUDE.md checklist):
 - JSON-parse failure fallback path: LLMClient raises LLMJSONParseError →
   agent returns a degraded QueryFilters from heuristic parse, never a 500.
+- Network failure fallback path: LLMClient raises a network-level exception
+  (ConnectionError, Timeout, HfHubHTTPError) → agent returns keyword-only
+  QueryFilters, never a 500.
 - Heuristic parser correctness for key field mappings (modality, species,
   age_range, condition, task).
 - LLM happy path: valid JSON from LLM → correct QueryFilters.
 """
 import pytest
+import requests.exceptions
 
 from unittest.mock import MagicMock, patch
+
+from huggingface_hub.errors import HfHubHTTPError, InferenceTimeoutError
 
 from app.agents.query_understanding_agent import QueryUnderstandingAgent
 from app.llm.client import LLMClient, LLMJSONParseError
@@ -80,6 +86,86 @@ class TestJsonParseFailureFallback:
         result = agent.parse("fMRI human adult")
         assert isinstance(result, QueryFilters)
         assert "fmri" in result.modality
+
+
+# ---------------------------------------------------------------------------
+# Network failure: the critical graceful-degradation path
+# ---------------------------------------------------------------------------
+
+class TestNetworkFailureFallback:
+    """
+    When the LLM endpoint is unreachable (network error, timeout, HTTP error),
+    parse() must return keyword-only QueryFilters, not propagate the exception
+    as a 500.  The fallback is distinguishable from the JSON-parse fallback by
+    the 'NETWORK failure' text in the log — these tests do not assert on log
+    output (that would couple to message wording), but do assert on the return
+    value.
+    """
+
+    def test_connection_error_returns_keyword_only_filters(self) -> None:
+        """requests.ConnectionError (DNS/socket failure) → keyword-only fallback."""
+        agent, _ = _make_agent_with_mock_llm(
+            generate_json_side_effect=requests.exceptions.ConnectionError("name resolution failed")
+        )
+        result = agent.parse("resting state fMRI ADHD")
+
+        assert isinstance(result, QueryFilters)
+        assert result.raw_query == "resting state fMRI ADHD"
+        # keyword-only path: keywords come from split(), heuristic fields are absent
+        assert result.keywords == ["resting", "state", "fMRI", "ADHD"]
+        assert result.modality == []
+
+    def test_timeout_error_returns_keyword_only_filters(self) -> None:
+        """requests.Timeout → keyword-only fallback."""
+        agent, _ = _make_agent_with_mock_llm(
+            generate_json_side_effect=requests.exceptions.Timeout("timed out")
+        )
+        result = agent.parse("EEG mouse data")
+
+        assert isinstance(result, QueryFilters)
+        assert result.raw_query == "EEG mouse data"
+        assert result.keywords == ["EEG", "mouse", "data"]
+        assert result.modality == []
+
+    def test_hf_hub_http_error_returns_keyword_only_filters(self) -> None:
+        """HfHubHTTPError (e.g. 503 from HF API) → keyword-only fallback."""
+        import requests as _requests
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+        mock_response.text = "Service Unavailable"
+        http_error = _requests.exceptions.HTTPError(response=mock_response)
+        hf_error = HfHubHTTPError("503 Service Unavailable", response=mock_response)
+
+        agent, _ = _make_agent_with_mock_llm(generate_json_side_effect=hf_error)
+        result = agent.parse("fMRI human adult BIDS")
+
+        assert isinstance(result, QueryFilters)
+        assert result.raw_query == "fMRI human adult BIDS"
+        assert result.keywords == ["fMRI", "human", "adult", "BIDS"]
+        assert result.modality == []
+
+    def test_inference_timeout_error_returns_keyword_only_filters(self) -> None:
+        """InferenceTimeoutError (HF-specific timeout wrapper) → keyword-only fallback."""
+        mock_response = MagicMock()
+        mock_response.status_code = 504
+        mock_response.text = "Gateway Timeout"
+        inf_timeout = InferenceTimeoutError("inference timed out", response=mock_response)
+
+        agent, _ = _make_agent_with_mock_llm(generate_json_side_effect=inf_timeout)
+        result = agent.parse("MEG pediatric autism")
+
+        assert isinstance(result, QueryFilters)
+        assert result.raw_query == "MEG pediatric autism"
+        assert result.keywords == ["MEG", "pediatric", "autism"]
+        assert result.modality == []
+
+    def test_unexpected_exception_still_propagates(self) -> None:
+        """A non-network, non-parse exception must NOT be swallowed — it should 500."""
+        agent, _ = _make_agent_with_mock_llm(
+            generate_json_side_effect=RuntimeError("unexpected internal error")
+        )
+        with pytest.raises(RuntimeError, match="unexpected internal error"):
+            agent.parse("any query")
 
 
 # ---------------------------------------------------------------------------

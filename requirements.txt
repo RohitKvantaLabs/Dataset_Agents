@@ -8,7 +8,7 @@ python-multipart>=0.0.12,<0.1
 uvicorn[standard]>=0.32,<0.35
 
 # LLM provider: remote inference only, no local model weights.
-huggingface-hub>=0.26,<0.28
+huggingface-hub>=0.28
 
 # HTTP / networking
 httpx>=0.27,<0.29
