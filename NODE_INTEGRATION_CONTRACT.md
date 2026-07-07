@@ -84,6 +84,20 @@ Python publishes to channel `fallback-result:{query_id}` (prefix configurable vi
 `datasets` can be an empty array - that's a valid "nothing found" outcome, not an error. Node
 should handle that in the UI rather than treating it as a failure.
 
+**Relevance filter (applied before any network check):** candidates whose title or URL contain
+spec/documentation signals (`specification`, `documentation`, `changelog`, `manual`, `user guide`,
+`white paper`, `readme.pdf`, `spec.pdf`) are dropped entirely, as are bare `.pdf` URLs. This means
+Node will never receive BIDS spec PDFs, standards documents, or README files as dataset results —
+they are filtered before the link-liveness check runs, not just ranked lower.
+
+**`is_direct_link`:** `true` when the URL resolves to a data file or archive (detected via URL
+extension, `Content-Type: application/zip/octet-stream/…`, or `Content-Disposition: attachment`).
+`false` for repository landing pages. Node can use this to display a "Direct download" badge.
+
+**`trust_tier`:** newly-found candidates always arrive as `"unverified"`. The scheduled
+`/api/v1/cron/reverify-links` job re-checks live URLs and upgrades them to `"verified"` or
+downgrades to `"stale"`. Node should not display `"stale"` links to users without a warning.
+
 These same datasets are also upserted into Mongo (`datasets` collection, keyed on
 `source + source_id`) at the same time, so the next identical query is a cache hit on Node's side.
 
