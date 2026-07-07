@@ -23,7 +23,7 @@ async def upsert_dataset(dataset: Dataset) -> None:
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    payload = dataset.model_dump(exclude={"id"}, exclude_none=False, mode="json")
+    payload = dataset.model_dump(exclude={"id", "ingested_at"}, exclude_none=False, mode="json")
     payload["updated_at"] = now.isoformat()
 
     await db[COLLECTION_NAME].find_one_and_update(
