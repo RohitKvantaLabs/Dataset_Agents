@@ -17,7 +17,13 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 
 from app.agents.fallback_agent import FallbackCandidate
-from app.agents.verification_agent import VerificationAgent, KNOWN_REPOSITORY_DOMAINS
+from app.agents.verification_agent import (
+    VerificationAgent,
+    KNOWN_REPOSITORY_DOMAINS,
+    NON_DATASET_SIGNAL_TERMS,
+    EXCLUDED_EXTENSIONS,
+    _is_non_dataset,
+)
 from app.models.dataset import Dataset, TrustTier
 
 
@@ -195,3 +201,86 @@ class TestKnownDomain:
             _make_candidate(url="https://some-random-lab-site.edu/data")
         ])
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Spec / documentation relevance filter
+# ---------------------------------------------------------------------------
+
+class TestSpecDocFilter:
+    """Candidates that are clearly specification or documentation must be dropped
+    before any network request is made."""
+
+    # --- unit tests for the helper ---
+
+    def test_is_non_dataset_spec_in_title(self) -> None:
+        assert _is_non_dataset("BIDS Specification", "https://bids.neuroimaging.io/bids_spec.pdf")
+
+    def test_is_non_dataset_pdf_url(self) -> None:
+        assert _is_non_dataset("Some Dataset", "https://example.org/docs/guide.pdf")
+
+    def test_is_non_dataset_documentation_in_url(self) -> None:
+        assert _is_non_dataset("OpenNeuro Guide", "https://openneuro.org/documentation/overview")
+
+    def test_is_non_dataset_changelog(self) -> None:
+        assert _is_non_dataset("BIDS Changelog", "https://bids.neuroimaging.io/changelog")
+
+    def test_is_non_dataset_readme_pdf(self) -> None:
+        assert _is_non_dataset("readme.pdf", "https://example.org/readme.pdf")
+
+    def test_is_non_dataset_whitespace_variant(self) -> None:
+        # "white paper" contains a space — must still match
+        assert _is_non_dataset("White Paper on fMRI", "https://example.org/whitepaper")
+
+    def test_is_not_non_dataset_normal_dataset(self) -> None:
+        assert not _is_non_dataset("fMRI resting-state", "https://openneuro.org/datasets/ds000001")
+
+    def test_is_not_non_dataset_nii_file(self) -> None:
+        assert not _is_non_dataset("T1 scan", "https://example.org/sub-01_T1w.nii.gz")
+
+    def test_pdf_with_query_string_still_dropped(self) -> None:
+        # query strings must be stripped before extension check
+        assert _is_non_dataset("doc", "https://example.org/report.pdf?v=2")
+
+    # --- integration: full verify() pipeline ---
+
+    @pytest.mark.asyncio
+    async def test_bids_spec_pdf_dropped_by_verify(self) -> None:
+        """A 'BIDS Specification' candidate with a .pdf URL must never appear
+        in the verified list, even if the URL would otherwise return 200."""
+        agent = _make_agent(head_status=200)
+        spec_candidate = _make_candidate(
+            title="BIDS Specification",
+            url="https://bids.neuroimaging.io/bids_spec.pdf",
+            source_guess="bids.neuroimaging.io",
+        )
+        result = await agent.verify([spec_candidate])
+        assert result == [], "Spec PDF should be filtered out before verification"
+
+    @pytest.mark.asyncio
+    async def test_spec_dropped_but_real_dataset_kept(self) -> None:
+        """When a spec PDF and a real dataset are in the same batch,
+        only the real dataset survives."""
+        agent = _make_agent(head_status=200)
+        spec = _make_candidate(
+            title="BIDS Specification",
+            url="https://bids.neuroimaging.io/bids_spec.pdf",
+        )
+        real = _make_candidate(
+            title="OpenNeuro ds000001",
+            url="https://openneuro.org/datasets/ds000001",
+        )
+        result = await agent.verify([spec, real])
+        assert len(result) == 1
+        assert "ds000001" in str(result[0].url)
+
+    @pytest.mark.asyncio
+    async def test_manual_pdf_dropped(self) -> None:
+        agent = _make_agent(head_status=200)
+        candidate = _make_candidate(
+            title="User Manual",
+            url="https://example.org/manual.pdf",
+        )
+        result = await agent.verify([candidate])
+        assert result == []
+

@@ -33,6 +33,11 @@ generic homepage or about-page links. A URL containing "dataset_description.json
 BIDS dataset signal. If you can only find a repository landing page, include it, but prefer the \
 more specific data URL.
 
+NEVER surface specification documents, standards documentation, whitepapers, README/changelog \
+files, user guides, or manuals as dataset candidates — even if they are hosted on a data \
+repository. Only return actual data files, dataset archives, or repository pages that host \
+downloadable subject-level data.
+
 Return AT MOST {max_candidates} candidates. If you are not confident a dataset genuinely exists \
 and matches, do not include it - an empty array is a valid and preferred answer over a guess. \
 Never return a final answer to the user; you are only proposing candidates for a separate \

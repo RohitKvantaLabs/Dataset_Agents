@@ -50,6 +50,26 @@ _BINARY_CONTENT_TYPES = {
     "application/x-tar",
 }
 
+# Signals in title/URL that identify specification or documentation documents —
+# never actual datasets, so drop outright (no network check needed).
+# ponytail: flat set, checked case-insensitively.
+NON_DATASET_SIGNAL_TERMS = {
+    "specification", "spec.pdf", "documentation", "changelog",
+    "manual", "readme.pdf", "white paper", "user guide",
+}
+
+# URL suffixes that are almost never datasets themselves.
+EXCLUDED_EXTENSIONS = {".pdf"}
+
+
+def _is_non_dataset(title: str, url: str) -> bool:
+    """Return True when the candidate is clearly a spec/doc, not a dataset."""
+    needle = (title + " " + url).lower()
+    if any(term in needle for term in NON_DATASET_SIGNAL_TERMS):
+        return True
+    lower_url = url.lower().split("?")[0].split("#")[0]  # strip query/fragment
+    return any(lower_url.endswith(ext) for ext in EXCLUDED_EXTENSIONS)
+
 
 def _is_direct_link_by_path(url: str) -> bool:
     """Check the URL path alone — no network needed."""
@@ -93,6 +113,10 @@ class VerificationAgent:
             if not candidate.url or candidate.url in seen_urls:
                 continue  # in-batch dedupe; DB-level dedupe happens via the upsert key
             seen_urls.add(candidate.url)
+
+            if _is_non_dataset(candidate.title, candidate.url):
+                logger.info("Dropping spec/doc candidate: %s", candidate.url)
+                continue
 
             is_live, domain, response = await self._check_link(candidate.url)
             if not is_live:
