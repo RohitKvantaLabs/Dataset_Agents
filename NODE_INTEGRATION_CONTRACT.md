@@ -72,6 +72,7 @@ Python publishes to channel `fallback-result:{query_id}` (prefix configurable vi
       "url": "https://...",
       "modality": [],
       "species": [],
+      "is_direct_link": false,
       "trust_tier": "unverified",
       "last_verified_at": null,
       "ingested_at": "2026-07-03T12:00:00Z",

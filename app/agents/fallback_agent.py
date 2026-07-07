@@ -39,7 +39,10 @@ class FallbackAgent:
         self._search = search_provider or NullSearchProvider()
 
     async def discover(self, filters: QueryFilters, max_candidates: int = 10) -> list[FallbackCandidate]:
-        web_hits = await self._search.search(filters.raw_query, max_results=max_candidates)
+        # ponytail: append filetype hint for Tavily; raw_query stays clean for the LLM prompt.
+        _SEARCH_HINT = "filetype:nii OR filetype:edf OR BIDS dataset download"
+        search_query = f"{filters.raw_query} {_SEARCH_HINT}"
+        web_hits = await self._search.search(search_query, max_results=max_candidates)
 
         try:
             llm_candidates = self._llm.generate_json(

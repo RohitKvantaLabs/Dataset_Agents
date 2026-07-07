@@ -27,6 +27,12 @@ Output ONLY a valid JSON array of candidate objects, no prose. Each object must 
 - source_guess: string (your best guess at the hosting repository/institution name)
 - reasoning: short string, why this matches
 
+Prefer direct file or archive links (e.g. .nii, .nii.gz, .dcm, .edf, .bdf, .fif, .nwb, .h5, \
+.hdf5, .mnc) or API download endpoints (e.g. a DANDI or OpenNeuro dataset download URL) over \
+generic homepage or about-page links. A URL containing "dataset_description.json" is a strong \
+BIDS dataset signal. If you can only find a repository landing page, include it, but prefer the \
+more specific data URL.
+
 Return AT MOST {max_candidates} candidates. If you are not confident a dataset genuinely exists \
 and matches, do not include it - an empty array is a valid and preferred answer over a guess. \
 Never return a final answer to the user; you are only proposing candidates for a separate \

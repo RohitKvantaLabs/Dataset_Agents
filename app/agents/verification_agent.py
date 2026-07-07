@@ -34,6 +34,43 @@ KNOWN_REPOSITORY_DOMAINS = {
     "ebrains.eu",
 }
 
+# Extensions that unambiguously identify an actual neuro data file/archive.
+# ponytail: flat set, no class hierarchy needed.
+KNOWN_DATASET_EXTENSIONS = {
+    ".dcm", ".nii", ".nii.gz", ".mnc", ".edf", ".bdf",
+    ".vhdr", ".vmrk", ".eeg", ".fif", ".nwb", ".h5", ".hdf5",
+}
+
+# Content-Type values that mean "binary blob / archive" (i.e. a download).
+_BINARY_CONTENT_TYPES = {
+    "application/octet-stream",
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-tar",
+}
+
+
+def _is_direct_link_by_path(url: str) -> bool:
+    """Check the URL path alone — no network needed."""
+    lower = url.lower()
+    if "dataset_description.json" in lower:
+        return True  # BIDS root marker
+    # Multi-char extensions like .nii.gz must be checked before .nii
+    for ext in sorted(KNOWN_DATASET_EXTENSIONS, key=len, reverse=True):
+        if lower.endswith(ext) or f"{ext}?" in lower or f"{ext}#" in lower:
+            return True
+    return False
+
+
+def _is_direct_link_by_headers(response: httpx.Response) -> bool:
+    """Inspect Content-Type / Content-Disposition without re-requesting."""
+    ct = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    if ct in _BINARY_CONTENT_TYPES:
+        return True
+    cd = response.headers.get("content-disposition", "").lower()
+    return "attachment" in cd
+
 
 class VerificationAgent:
     """
@@ -57,9 +94,29 @@ class VerificationAgent:
                 continue  # in-batch dedupe; DB-level dedupe happens via the upsert key
             seen_urls.add(candidate.url)
 
-            is_live, domain = await self._check_link(candidate.url)
+            is_live, domain, response = await self._check_link(candidate.url)
             if not is_live:
                 logger.info("Dropping dead/unreachable candidate: %s", candidate.url)
+                continue
+
+            # Determine is_direct_link: path first (free), then headers.
+            if _is_direct_link_by_path(candidate.url):
+                is_direct = True
+            elif response is not None:
+                is_direct = _is_direct_link_by_headers(response)
+            else:
+                is_direct = False
+
+            # Only drop unknown-domain landing-page candidates with no credibility signal.
+            if (
+                not is_direct
+                and domain not in KNOWN_REPOSITORY_DOMAINS
+                and not candidate.source_guess
+            ):
+                logger.info(
+                    "Dropping unknown-domain landing page with no credibility signal: %s",
+                    candidate.url,
+                )
                 continue
 
             # Derive a stable, unique source_id from the URL so the
@@ -77,6 +134,7 @@ class VerificationAgent:
                     source=source,
                     source_id=source_id,
                     url=candidate.url,
+                    is_direct_link=is_direct,
                 )
             except Exception as exc:  # invalid URL, malformed data, etc.
                 logger.info(
@@ -98,18 +156,18 @@ class VerificationAgent:
         Re-check an existing dataset URL for scheduled link maintenance.
         A successful re-check confirms VERIFIED; a failed check marks STALE.
         """
-        is_live, _ = await self._check_link(str(dataset.url))
+        is_live, _, _ = await self._check_link(str(dataset.url))
         if self._owns_client:
             await self._client.aclose()
         return TrustTier.VERIFIED if is_live else TrustTier.STALE
 
-    async def _check_link(self, url: str) -> tuple[bool, str]:
-        """Return (is_live, domain). Handles malformed URLs gracefully."""
+    async def _check_link(self, url: str) -> tuple[bool, str, httpx.Response | None]:
+        """Return (is_live, domain, response). Handles malformed URLs gracefully."""
         try:
             parsed = httpx.URL(url)
         except Exception:
             logger.info("Malformed URL, skipping: %s", url)
-            return False, ""
+            return False, "", None
 
         domain = parsed.host or ""
         try:
@@ -117,7 +175,7 @@ class VerificationAgent:
             if resp.status_code >= 400:
                 # Some servers reject HEAD — retry with a lightweight GET before giving up.
                 resp = await self._client.get(url)
-            return resp.status_code < 400, domain
+            return resp.status_code < 400, domain, resp
         except httpx.HTTPError as exc:
             logger.info("Link check failed for %s: %s", url, exc)
-            return False, domain
+            return False, domain, None

@@ -30,6 +30,9 @@ class Dataset(BaseModel):
 
     license: str | None = None
 
+    is_direct_link: bool = False
+    """True if the URL points at an actual data file/archive rather than a repository landing page."""
+
     trust_tier: TrustTier = TrustTier.UNVERIFIED
     confidence_score: float | None = None   # set by the ranking service
 
