@@ -10,6 +10,7 @@ before it is stored in Mongo or shown to a user. Three checks:
 A stable source_id is derived from a SHA-1 hash of the URL so the atomic
 (source, source_id) upsert key in dataset_repository is always populated.
 """
+import asyncio
 import hashlib
 import logging
 
@@ -109,16 +110,29 @@ class VerificationAgent:
         verified: list[Dataset] = []
         seen_urls: set[str] = set()
 
+        # Deduplicate and filter doc/spec candidates before any network I/O.
+        unique_candidates: list[FallbackCandidate] = []
         for candidate in candidates:
             if not candidate.url or candidate.url in seen_urls:
                 continue  # in-batch dedupe; DB-level dedupe happens via the upsert key
             seen_urls.add(candidate.url)
-
             if _is_non_dataset(candidate.title, candidate.url):
                 logger.info("Dropping spec/doc candidate: %s", candidate.url)
                 continue
+            unique_candidates.append(candidate)
 
-            is_live, domain, response = await self._check_link(candidate.url)
+        # ponytail: parallel URL checks — all fire at once, total time ≈ slowest single URL.
+        link_results = await asyncio.gather(
+            *[self._check_link(c.url) for c in unique_candidates],
+            return_exceptions=True,
+        )
+
+        for candidate, result in zip(unique_candidates, link_results):
+            if isinstance(result, Exception):
+                logger.info("Link check raised for %s: %s", candidate.url, result)
+                continue
+
+            is_live, domain, response = result
             if not is_live:
                 logger.info("Dropping dead/unreachable candidate: %s", candidate.url)
                 continue
