@@ -49,6 +49,7 @@ class FallbackSearchResponse(BaseModel):
     query_id: str
     datasets_found: int
     published: bool
+    datasets: list[Dataset]
 
 
 @router.post("/agents/fallback-search", response_model=FallbackSearchResponse)
@@ -78,4 +79,5 @@ async def fallback_search(payload: FallbackSearchRequest):
         query_id=payload.query_id,
         datasets_found=len(verified_datasets),
         published=True,
+        datasets=verified_datasets,
     )

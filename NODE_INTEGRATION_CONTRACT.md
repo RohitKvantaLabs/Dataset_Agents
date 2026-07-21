@@ -35,10 +35,10 @@ empty) rather than erroring - Node can still attempt a plain-text search.
 ---
 
 ## 2. POST /api/v1/agents/fallback-search
-**Fire-and-forget from Node's side** - Node does not need to read the response body, but the
-request itself must stay open; Python does not use background tasks (see code comments in
-`app/api/v1/agents.py` for why - Vercel-specific). Give the HTTP client a generous timeout
-(60s+) or set it to not wait on the body at all.
+**Blocking from Node's side** - Node waits for the completed response and returns its datasets
+to the frontend. Python does not use background tasks (see code comments in
+`app/api/v1/agents.py` for why - Vercel-specific), so give the HTTP client a generous timeout
+(60s+).
 
 **Request**
 ```json
@@ -51,12 +51,12 @@ request itself must stay open; Python does not use background tasks (see code co
 `query_id` is whatever Node uses to correlate the eventual Redis message back to the right
 frontend connection (websocket/SSE session, request id, etc.) - Python does not generate this.
 
-**Response `200`** (safe to ignore)
+**Response `200`**
 ```json
-{ "query_id": "sess_abc123", "datasets_found": 3, "published": true }
+{ "query_id": "sess_abc123", "datasets_found": 3, "published": true, "datasets": [] }
 ```
 
-**What actually matters: the Redis message.**
+Node should use `datasets` as the user-facing result. Python also publishes the same payload to Redis for optional asynchronous consumers.
 Python publishes to channel `fallback-result:{query_id}` (prefix configurable via
 `REDIS_RESULT_CHANNEL_PREFIX`) exactly once, when the job finishes:
 ```json

@@ -186,6 +186,7 @@ class TestFallbackSearchResponse:
         assert body["query_id"] == "sess_abc123"
         assert body["datasets_found"] == 0
         assert body["published"] is True
+        assert body["datasets"] == []
 
     def test_response_shape_matches_contract(
         self, client: TestClient, auth_headers: dict
@@ -203,7 +204,7 @@ class TestFallbackSearchResponse:
                 json=_FALLBACK_PAYLOAD,
             )
         body = resp.json()
-        for field in ("query_id", "datasets_found", "published"):
+        for field in ("query_id", "datasets_found", "published", "datasets"):
             assert field in body, f"Missing contract field: {field}"
 
     def test_upsert_not_called_when_no_datasets(
