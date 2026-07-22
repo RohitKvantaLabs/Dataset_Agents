@@ -29,13 +29,8 @@ class FallbackAgent:
         if llm_client is not None:
             self._llm: LLMClient = llm_client
         else:
-            # Qwen2.5-7B-Instruct: superior at open-ended multi-step
-            # reasoning and long-context generation — perfect for
-            # discovering dataset candidates from web snippets + filters.
-            # HF_TOKEN is required at startup (pydantic enforces this), so
-            # get_settings() is guaranteed to succeed here.
             settings = get_settings()
-            self._llm = LLMClient(model=settings.HF_FALLBACK_MODEL)
+            self._llm = LLMClient(model=settings.GROQ_FALLBACK_MODEL)
         self._search = search_provider or NullSearchProvider()
 
     async def discover(self, filters: QueryFilters, max_candidates: int = 10) -> list[FallbackCandidate]:

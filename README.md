@@ -61,8 +61,8 @@ cp .env .env.local   # optional — .env is gitignored
 Then edit `.env`:
 
 ```ini
-# Required for query parsing + fallback LLM discovery
-HF_TOKEN=hf_xxxx                          # Hugging Face Inference API token
+# Required for all LLM calls (Query Understanding + Fallback Discovery)
+GROQ_API_KEY=gsk_xxxx                     # Get a key at https://console.groq.com/keys
 
 # Required for real web search in the Fallback Agent
 TAVILY_API_KEY=tvly-xxxx                  # Get a free key at https://app.tavily.com/
@@ -78,17 +78,21 @@ MONGO_DB_NAME=neuro_data_platform
 REDIS_URL=redis://localhost:6379/0
 ```
 
-`HF_TOKEN` and `TAVILY_API_KEY` are required startup configuration. Verified
+`GROQ_API_KEY` and `TAVILY_API_KEY` are required startup configuration. Verified
 behavior in this workspace:
 
 - With the required values present in `.env`, the app imports successfully and
   the server responds normally on the health endpoint.
-- If either token is unset, `pydantic-settings` raises validation errors while
+- If either required value is unset, `pydantic-settings` raises validation errors while
   importing `app.main`, so the FastAPI app does not start.
 
-`parse-query` still has a deterministic fallback for LLM output/parse failures
-after the service has started with a valid `HF_TOKEN`; that fallback is not a
+`parse-query` has a deterministic fallback for LLM output/parse failures
+after the service has started with a valid `GROQ_API_KEY`; that fallback is not a
 no-token operating mode.
+
+A retained `HF_TOKEN` is optional — it is only used by the ingestion
+embedder (vector embeddings for Atlas Search). If absent, embeddings are
+skipped gracefully.
 
 ### 4. Create MongoDB indexes (run once, before production traffic)
 
@@ -208,7 +212,7 @@ Key constraints (full details in `CLAUDE.md`):
 | Atomic `find_one_and_update(upsert=True)` only | Two fallback workers can race on the same dataset |
 | `X-Internal-Secret` on every endpoint | Each call may trigger a paid LLM call — cost control |
 | No LLM in `VerificationAgent` | Candidates must be independently verified, not LLM-trusted |
-| All LLM calls through `app/llm/client.py` | Provider swap is a one-file change |
+| All LLM calls through `app/llm/client.py` | Provider swap is a single-file change (now uses Groq) |
 
 ---
 
@@ -217,7 +221,7 @@ Key constraints (full details in `CLAUDE.md`):
 | Item | Status |
 |---|---|
 | `TAVILY_API_KEY` | Required in `.env` — the app fails startup validation without it |
-| `HF_TOKEN` | Required in `.env` — the app fails startup validation without it |
+| `GROQ_API_KEY` | Required in `.env` — the app fails startup validation without it |
 | `INTERNAL_API_SECRET` | Set the same value in Node's env |
 | Vercel plan `maxDuration` | Confirm your plan supports 60s — Hobby plan doesn't |
 | Redis channel name with Node | Confirm Node subscribes to `fallback-result:{query_id}` (default) |

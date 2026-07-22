@@ -17,30 +17,22 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_RESULT_CHANNEL_PREFIX: str = "fallback-result:"  # + query_id
 
-    # --- Hugging Face API token (shared across all HF Inference endpoints) ---
-    # Required at startup. Query parsing has a heuristic fallback for LLM
-    # response failures, but this service is not configured to run without HF.
-    HF_TOKEN: str
+    # --- Groq API key (required) ---
+    GROQ_API_KEY: str
 
     # Model for Phase-1 Query Understanding Agent (structured JSON extraction
-    # from natural language). Mistral-7B-Instruct is instruction-tuned for
-    # tight JSON output and has low latency on the free HF Inference tier.
-    HF_QUERY_MODEL: str = "mistralai/Mistral-7B-Instruct-v0.3"
+    # from natural language). Llama 3.1 8B Instant is fast and reliable for
+    # structured JSON output via Groq's JSON mode.
+    GROQ_QUERY_MODEL: str = "llama-3.1-8b-instant"
 
     # Model for the Fallback / Discovery Agent (open-ended reasoning, URL
-    # candidate generation). Qwen2.5-7B-Instruct excels at long-context
-    # reasoning and multi-step tool-like generation.
-    HF_FALLBACK_MODEL: str = "Qwen/Qwen2.5-7B-Instruct"
+    # candidate generation). Llama 3.3 70B Versatile excels at long-context
+    # reasoning and multi-step generation.
+    GROQ_FALLBACK_MODEL: str = "llama-3.3-70b-versatile"
 
-    # Model for vector embeddings (feature-extraction). all-MiniLM-L6-v2
-    # produces 384-dim sentence vectors; fast, lightweight, and free-tier.
+    # Retained for the embedder (optional — if absent, embedding is skipped).
+    HF_TOKEN: str | None = None
     HF_EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
-
-    # Legacy alias kept for any caller that hasn't been updated yet.
-    # Points to the query-understanding model so old code stays functional.
-    @property
-    def HF_LLM_MODEL(self) -> str:  # noqa: N802
-        return self.HF_QUERY_MODEL
 
     HTTP_CHECK_TIMEOUT_SECONDS: int = 8
     REQUEST_TIMEOUT_SECONDS: int = 20

@@ -1,7 +1,6 @@
 import logging
 
-import requests.exceptions
-from huggingface_hub.errors import HfHubHTTPError, InferenceTimeoutError
+from groq import APIError as GroqAPIError
 
 from app.config import get_settings
 from app.llm.client import LLMClient, LLMJSONParseError
@@ -22,12 +21,10 @@ class QueryUnderstandingAgent:
         self._llm = llm_client
         if self._llm is None:
             try:
-                # Mistral-7B-Instruct: optimised for tight structured-JSON
-                # output with minimal latency — ideal for Phase-1 parsing.
                 settings = get_settings()
-                self._llm = LLMClient(model=settings.HF_QUERY_MODEL)
-                self._provider = "huggingface"
-            except ValueError:
+                self._llm = LLMClient(model=settings.GROQ_QUERY_MODEL)
+                self._provider = "groq"
+            except Exception:
                 self._llm = None
 
     @property
@@ -49,12 +46,7 @@ class QueryUnderstandingAgent:
         except (LLMJSONParseError, TypeError, ValueError) as exc:
             logger.warning("Query parsing fell back to heuristic mode: %s", exc)
             return self._heuristic_parse(raw_query)
-        except (
-            HfHubHTTPError,
-            InferenceTimeoutError,
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        ) as exc:
+        except GroqAPIError as exc:
             logger.warning(
                 "Query parsing fell back to keyword-only filters due to NETWORK failure "
                 "(LLM endpoint unreachable — not a malformed-response error): %s",

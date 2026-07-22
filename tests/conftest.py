@@ -1,8 +1,8 @@
 """
 Shared test fixtures.
 
-Design rules (from CLAUDE.md):
-- Never hit real HuggingFace, Tavily, MongoDB, or Redis in tests.
+Design rules:
+- Never hit real Groq, Tavily, MongoDB, or Redis in tests.
 - Override INTERNAL_API_SECRET by patching get_settings in every module
   that imports it directly (security.py, agents, etc.).
 - Mock Motor with AsyncMock so async collection operations don't crash.
@@ -25,7 +25,7 @@ def _make_test_settings() -> Settings:
     return Settings(
         INTERNAL_API_SECRET=TEST_SECRET,
         CRON_SECRET=TEST_CRON_SECRET,
-        HF_TOKEN="hf_test",
+        GROQ_API_KEY="gsk_test",
         TAVILY_API_KEY="tvly-test",
         MONGO_URI="mongodb://localhost:27017",
         REDIS_URL="redis://localhost:6379/0",

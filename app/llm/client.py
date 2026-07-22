@@ -1,13 +1,12 @@
 """
 Thin wrapper around the LLM provider. Everything else in the codebase
-calls `LLMClient`, never huggingface_hub directly - so switching to a
-paid provider later (Anthropic/OpenAI) means rewriting this one file,
-not every agent that uses an LLM.
+calls `LLMClient`, never the Groq SDK directly - so switching providers
+later means rewriting this one file, not every agent that uses an LLM.
 """
 import json
 import logging
 
-from huggingface_hub import InferenceClient
+from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import get_settings
@@ -22,39 +21,38 @@ class LLMJSONParseError(Exception):
 class LLMClient:
     def __init__(self, model: str | None = None) -> None:
         settings = get_settings()
-        if not settings.HF_TOKEN:
-            raise ValueError(
-                "HF_TOKEN is not set — LLMClient requires a Hugging Face API token. "
-                "Set HF_TOKEN in your environment or .env file."
-            )
-        # If no model is specified, default to the query-understanding model.
-        # Callers that need a different model (e.g. FallbackAgent) pass it
-        # explicitly so the right endpoint is used without touching settings.
-        self._model = model or settings.HF_QUERY_MODEL
-        self._client = InferenceClient(model=self._model, token=settings.HF_TOKEN)
+        self._model = model or settings.GROQ_QUERY_MODEL
+        self._client = Groq(api_key=settings.GROQ_API_KEY)
         logger.debug("LLMClient initialised with model=%s", self._model)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8), reraise=True)
-    def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 512) -> str:
-        response = self._client.chat_completion(
-            messages=[
+    def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 512, response_format: dict | None = None) -> str:
+        kwargs = {
+            "model": self._model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=max_tokens,
-            temperature=0.1,  # low temp: this pipeline needs consistency, not creativity
-        )
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+        if response_format:
+            kwargs["response_format"] = response_format
+        response = self._client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
     def generate_json(self, system_prompt: str, user_prompt: str, max_tokens: int = 512) -> dict:
         """
-        Free-tier HF models don't reliably support native function-calling,
-        so we enforce structure via prompting + strict parsing rather than
-        a tool-call API. If/when you move to a paid provider with real
-        structured-output support, swap the internals here - callers don't
-        need to change.
+        Uses Groq's JSON mode (response_format={"type": "json_object"}) to
+        enforce structured output. The prompt must still instruct the model
+        to produce JSON — Groq's JSON mode requires it.
         """
-        raw = self._chat(system_prompt, user_prompt, max_tokens=max_tokens)
+        raw = self._chat(
+            system_prompt,
+            user_prompt,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
             return json.loads(cleaned)
