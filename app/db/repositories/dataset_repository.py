@@ -26,7 +26,7 @@ async def upsert_dataset(dataset: Dataset) -> None:
     payload = dataset.model_dump(exclude={"id", "ingested_at"}, exclude_none=False, mode="json")
     payload["updated_at"] = now.isoformat()
 
-    await db[COLLECTION_NAME].find_one_and_update(
+    doc = await db[COLLECTION_NAME].find_one_and_update(
         {"source": dataset.source, "source_id": dataset.source_id},
         {
             "$set": payload,
@@ -35,7 +35,9 @@ async def upsert_dataset(dataset: Dataset) -> None:
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    logger.info("Upserted dataset source=%s source_id=%s", dataset.source, dataset.source_id)
+    if doc and "_id" in doc:
+        dataset.id = str(doc["_id"])
+    logger.info("Upserted dataset source=%s source_id=%s id=%s", dataset.source, dataset.source_id, dataset.id)
 
 
 async def upsert_many(datasets: list[Dataset]) -> int:
