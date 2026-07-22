@@ -19,6 +19,7 @@ import httpx
 from app.agents.fallback_agent import FallbackCandidate
 from app.config import get_settings
 from app.models.dataset import Dataset, TrustTier
+from app.models.query_filters import QueryFilters
 
 logger = logging.getLogger("neuro_platform.agents.verification")
 
@@ -106,7 +107,7 @@ class VerificationAgent:
             timeout=settings.HTTP_CHECK_TIMEOUT_SECONDS, follow_redirects=True
         )
 
-    async def verify(self, candidates: list[FallbackCandidate]) -> list[Dataset]:
+    async def verify(self, candidates: list[FallbackCandidate], filters: QueryFilters | None = None) -> list[Dataset]:
         verified: list[Dataset] = []
         seen_urls: set[str] = set()
 
@@ -165,6 +166,24 @@ class VerificationAgent:
             if domain in KNOWN_REPOSITORY_DOMAINS:
                 logger.info("Candidate %s is from a known repository domain", candidate.url)
 
+            # Extract modality, species and keywords from filters if available (ponytail: keep it minimal and case-consistent)
+            modality = []
+            species = []
+            keywords = []
+            if filters:
+                modality = [m.lower() for m in filters.modality] if filters.modality else []
+                species = [s.lower() for s in filters.species] if filters.species else []
+                kws = set()
+                if filters.condition:
+                    kws.update(c.lower() for c in filters.condition)
+                if filters.task:
+                    kws.add(filters.task.lower())
+                if filters.format:
+                    kws.update(f.lower() for f in filters.format)
+                if filters.keywords:
+                    kws.update(k.lower() for k in filters.keywords)
+                keywords = list(kws)
+
             try:
                 dataset = Dataset(
                     title=candidate.title,
@@ -173,6 +192,9 @@ class VerificationAgent:
                     source_id=source_id,
                     url=candidate.url,
                     is_direct_link=is_direct,
+                    modality=modality,
+                    species=species,
+                    keywords=keywords,
                 )
             except Exception as exc:  # invalid URL, malformed data, etc.
                 logger.info(

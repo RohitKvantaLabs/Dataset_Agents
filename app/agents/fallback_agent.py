@@ -52,8 +52,8 @@ class FallbackAgent:
                 ),
                 max_tokens=800,
             )
-        except LLMJSONParseError:
-            logger.warning("Fallback LLM discovery returned unparseable output for %r", filters.raw_query)
+        except Exception as exc:
+            logger.warning("Fallback LLM discovery failed for %r: %s", filters.raw_query, exc)
             llm_candidates = []
 
         if not isinstance(llm_candidates, list):

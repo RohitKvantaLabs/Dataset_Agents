@@ -61,7 +61,7 @@ async def fallback_search(payload: FallbackSearchRequest):
     candidates = await fallback_agent.discover(filters, max_candidates=settings.MAX_FALLBACK_CANDIDATES)
 
     verification_agent = VerificationAgent()
-    verified_datasets: list[Dataset] = await verification_agent.verify(candidates)
+    verified_datasets: list[Dataset] = await verification_agent.verify(candidates, filters=filters)
 
     if verified_datasets:
         await upsert_many(verified_datasets)
