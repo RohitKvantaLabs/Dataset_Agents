@@ -1,4 +1,5 @@
 import logging
+import time
 
 from fastapi import APIRouter, Depends
 
@@ -18,6 +19,10 @@ logger = logging.getLogger("neuro_platform.api.agents")
 
 router = APIRouter(dependencies=[Depends(require_internal_secret)])
 
+# ponytail: module-level parse cache — same query within 5 min returns cached filters.
+_parse_cache: dict[str, tuple[QueryFilters, float]] = {}
+_PARSE_CACHE_TTL = 300  # seconds
+
 
 # ---------------------------------------------------------------------
 # 1. Query Understanding — BLOCKING. Node waits on this response before
@@ -25,8 +30,15 @@ router = APIRouter(dependencies=[Depends(require_internal_secret)])
 # ---------------------------------------------------------------------
 @router.post("/agents/parse-query", response_model=ParseQueryResponse)
 async def parse_query(payload: ParseQueryRequest):
+    now = time.time()
+    cached = _parse_cache.get(payload.query)
+    if cached and now - cached[1] < _PARSE_CACHE_TTL:
+        logger.info("parse_query cache hit for query=%r", payload.query)
+        return ParseQueryResponse(filters=cached[0])
+
     agent = QueryUnderstandingAgent()
     filters = agent.parse(payload.query)
+    _parse_cache[payload.query] = (filters, now)
     return ParseQueryResponse(filters=filters)
 
 

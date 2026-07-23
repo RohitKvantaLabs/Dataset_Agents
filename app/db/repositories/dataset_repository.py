@@ -41,11 +41,10 @@ async def upsert_dataset(dataset: Dataset) -> None:
 
 
 async def upsert_many(datasets: list[Dataset]) -> int:
-    count = 0
-    for ds in datasets:
-        await upsert_dataset(ds)
-        count += 1
-    return count
+    # ponytail: parallel upserts — N separate network roundtrips fire at once.
+    import asyncio
+    await asyncio.gather(*[upsert_dataset(ds) for ds in datasets])
+    return len(datasets)
 
 
 async def find_datasets_for_reverification(stale_before: datetime, limit: int) -> list[Dataset]:

@@ -3,7 +3,7 @@ FastAPI application factory.
 
 Lifecycle
 ---------
-startup  → no eager startup work
+startup  → ensure MongoDB indexes (idempotent)
 shutdown → close the Motor client connection pool
 
 CORS is configured to allow the MERN frontend origin (adjust
@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
+from app.db.indexes import ensure_indexes
 from app.db.mongo import get_client
 
 logger = logging.getLogger("neuro_platform.main")
@@ -24,6 +25,11 @@ logger = logging.getLogger("neuro_platform.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ponytail: ensure indexes on startup — idempotent, fast after first run.
+    try:
+        await ensure_indexes()
+    except Exception as exc:
+        logger.warning("Index creation failed (non-fatal): %s", exc)
     yield
     logger.info("Shutting down — closing MongoDB connection pool...")
     try:
