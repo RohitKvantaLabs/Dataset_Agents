@@ -13,7 +13,6 @@ out/
 logs/
 *.log
 
-
 # Python cache and environments
 __pycache__/
 *.py[cod]
