@@ -35,6 +35,7 @@ class Dataset(BaseModel):
 
     trust_tier: TrustTier = TrustTier.UNVERIFIED
     confidence_score: float | None = None   # set by the ranking service
+    quality_score: float | None = None      # set by the scorer in the ingestion pipeline
 
     embedding: list[float] | None = Field(default=None, exclude=True)  # never serialize to API responses
 

@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,6 +47,19 @@ class Settings(BaseSettings):
 
     # Fallback pipeline: max dataset candidates to surface per query.
     MAX_FALLBACK_CANDIDATES: int = 10
+
+    # Comma-separated list of allowed CORS origins.
+    # Browsers reject allow_origins=["*"] with allow_credentials=True,
+    # so this must always be an explicit list in production.
+    ALLOWED_ORIGINS: list[str] = ["https://neuro-frontend-two.vercel.app", "https://neuro-server.vercel.app"]
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def split_origins(cls, v):
+        """Accept both JSON array (pydantic-settings default) and comma-sep string."""
+        if isinstance(v, str):
+            return [o.strip() for o in v.split(",") if o.strip()]
+        return v
 
     # Scheduled link re-verification controls.
     CRON_STALE_THRESHOLD_DAYS: int = 30

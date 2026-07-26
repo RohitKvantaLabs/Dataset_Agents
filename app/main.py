@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
+from app.core.exceptions import register_exception_handlers
 from app.db.indexes import ensure_indexes
 from app.db.mongo import get_client
 
@@ -29,7 +30,7 @@ async def lifespan(app: FastAPI):
     try:
         await ensure_indexes()
     except Exception as exc:
-        logger.warning("Index creation failed (non-fatal): %s", exc)
+        logger.error("Index creation failed — app will run without indexes: %s", exc)
     yield
     logger.info("Shutting down — closing MongoDB connection pool...")
     try:
@@ -51,15 +52,35 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS — allow the MERN/Next.js frontend and Vercel preview URLs.
-    # Tighten allow_origins in production to your specific domain(s).
+    # CORS — read allow_origins from ALLOWED_ORIGINS config.
+    # allow_origins and allow_credentials=True are compatible only when
+    # origins are explicitly listed (browsers reject ["*"] with credentials).
+    allowed = list(settings.ALLOWED_ORIGINS)
+    if not allowed:
+        allowed = ["https://neuro-frontend-two.vercel.app"]
+
+    # Guardrail: reject any wildcard origin before middleware init.
+    # A wildcard combined with allow_credentials=True is silently rejected
+    # by browsers but can still create a false sense of security; we fail
+    # hard at startup instead of relying on browser-side enforcement.
+    if "*" in allowed:
+        raise RuntimeError(
+            "CORS allow_origins must not contain '*'. "
+            "Explicit origins are required when allow_credentials=True. "
+            f"Got: {allowed}"
+        )
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],   # tighten in prod
+        allow_origins=allowed,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Register custom exception handlers so UpstreamServiceError surfaces
+    # as 502 Bad Gateway instead of a generic 500.
+    register_exception_handlers(app)
 
     app.include_router(api_v1_router, prefix=settings.API_V1_PREFIX)
 

@@ -27,7 +27,7 @@ from app.db.repositories.dataset_repository import upsert_dataset
 from app.ingestion.embedder import Embedder
 from app.ingestion.normalizer import normalize
 from app.models.dataset import Dataset
-from app.services.redis_publisher.py import score_dataset
+from app.ingestion.scorer import score_dataset
 
 logger = logging.getLogger("neuro_platform.ingestion.pipeline")
 
