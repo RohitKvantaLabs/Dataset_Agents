@@ -16,6 +16,14 @@ import httpx
 
 from app.config import get_settings
 from app.connectors.base import BaseConnector
+from app.core.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
+
+# Module-level circuit breaker for DANDI API calls.
+_dandi_circuit_breaker = CircuitBreaker(
+    name="dandi-api",
+    failure_threshold=3,
+    recovery_timeout=30.0,
+)
 
 logger = logging.getLogger("neuro_platform.connectors.dandi")
 
@@ -54,23 +62,26 @@ class DandiConnector(BaseConnector):
         url: str | None = f"{DANDI_API_BASE}/dandisets/?page_size={min(PAGE_SIZE, limit)}"
 
         try:
-            while url and len(records) < limit:
-                remaining = limit - len(records)
-                paged_url = self._inject_page_size(url, min(PAGE_SIZE, remaining))
+            async with _dandi_circuit_breaker:
+                while url and len(records) < limit:
+                    remaining = limit - len(records)
+                    paged_url = self._inject_page_size(url, min(PAGE_SIZE, remaining))
 
-                logger.debug("DANDI fetch: GET %s", paged_url)
-                resp = await self._client.get(paged_url)
-                resp.raise_for_status()
-                data = resp.json()
+                    logger.debug("DANDI fetch: GET %s", paged_url)
+                    resp = await self._client.get(paged_url)
+                    resp.raise_for_status()
+                    data = resp.json()
 
-                results = data.get("results", [])
-                records.extend(results)
-                url = data.get("next")  # None when exhausted
+                    results = data.get("results", [])
+                    records.extend(results)
+                    url = data.get("next")  # None when exhausted
 
         except httpx.HTTPStatusError as exc:
             logger.error("DANDI API HTTP error: %s %s", exc.response.status_code, exc.request.url)
         except httpx.RequestError as exc:
             logger.error("DANDI API request failed: %s", exc)
+        except CircuitBreakerOpenError as exc:
+            logger.warning("DANDI API circuit is open: %s", exc)
         finally:
             if self._owns_client:
                 await self._client.aclose()

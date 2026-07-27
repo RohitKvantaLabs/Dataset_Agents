@@ -3,6 +3,7 @@ import logging
 from groq import APIError as GroqAPIError
 
 from app.config import get_settings
+from app.core.circuit_breaker import CircuitBreakerOpenError
 from app.llm.client import LLMClient, LLMJSONParseError
 from app.llm.prompts import QUERY_UNDERSTANDING_SYSTEM_PROMPT, query_understanding_user_prompt
 from app.models.query_filters import QueryFilters
@@ -46,10 +47,10 @@ class QueryUnderstandingAgent:
         except (LLMJSONParseError, TypeError, ValueError) as exc:
             logger.warning("Query parsing fell back to heuristic mode: %s", exc)
             return self._heuristic_parse(raw_query)
-        except GroqAPIError as exc:
+        except (GroqAPIError, CircuitBreakerOpenError) as exc:
             logger.warning(
                 "Query parsing fell back to keyword-only filters due to NETWORK failure "
-                "(LLM endpoint unreachable — not a malformed-response error): %s",
+                "(LLM endpoint unreachable or circuit open — not a malformed-response error): %s",
                 exc,
             )
             return QueryFilters(raw_query=raw_query, keywords=raw_query.split())

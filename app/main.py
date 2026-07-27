@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
@@ -77,6 +78,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Response compression — gzip for JSON and text responses >= 1 KB.
+    # minimum_size is the response-body byte threshold below which compression
+    # is skipped (tiny responses like health checks don't benefit).
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     # Register custom exception handlers so UpstreamServiceError surfaces
     # as 502 Bad Gateway instead of a generic 500.

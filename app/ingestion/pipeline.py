@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.connectors.base import BaseConnector
-from app.db.repositories.dataset_repository import upsert_dataset
+from app.db.repositories.dataset_repository import bulk_upsert
 from app.ingestion.embedder import Embedder
 from app.ingestion.normalizer import normalize
 from app.models.dataset import Dataset
@@ -91,7 +91,8 @@ async def run_pipeline(
     result.fetched = len(raw_records)
     logger.info("Pipeline[%s]: fetched %d records", connector.source_name, result.fetched)
 
-    # --- Steps 2–5: Normalize → Score → Embed → Upsert ---
+    # --- Steps 2–4: Normalize → Score → Embed (collect in list) ---
+    batch: list[Dataset] = []
     for raw in raw_records:
         dataset: Optional[Dataset] = None
         try:
@@ -109,14 +110,10 @@ async def run_pipeline(
             if embedder and result.embedding_enabled:
                 vector = embedder.embed_dataset_text(dataset.title, dataset.description)
                 if vector:
-                    # Store the embedding alongside the document via model_extra.
-                    # The upsert payload will include it as a top-level field.
                     dataset.__pydantic_extra__ = dataset.__pydantic_extra__ or {}
                     dataset.__pydantic_extra__["embedding"] = vector
 
-            # 5. Upsert
-            await upsert_dataset(dataset)
-            result.upserted += 1
+            batch.append(dataset)
 
         except Exception as exc:  # noqa: BLE001
             result.errors += 1
@@ -125,6 +122,10 @@ async def run_pipeline(
             logger.warning("Pipeline[%s]: error processing record: %s", connector.source_name, sample)
             if len(result.error_samples) < 5:
                 result.error_samples.append(sample)
+
+    # --- Step 5: Batch upsert (single bulkWrite round-trip per chunk) ---
+    if batch:
+        result.upserted = await bulk_upsert(batch)
 
     logger.info(
         "Pipeline[%s]: done | fetched=%d normalized=%d upserted=%d errors=%d skipped=%d",

@@ -17,6 +17,14 @@ import httpx
 
 from app.config import get_settings
 from app.connectors.base import BaseConnector
+from app.core.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
+
+# Module-level circuit breaker for OpenNeuro API calls.
+_openneuro_circuit_breaker = CircuitBreaker(
+    name="openneuro-api",
+    failure_threshold=3,
+    recovery_timeout=30.0,
+)
 
 logger = logging.getLogger("neuro_platform.connectors.openneuro")
 
@@ -91,39 +99,40 @@ class OpenNeuroConnector(BaseConnector):
         page_size = min(PAGE_SIZE, limit)
 
         try:
-            while len(records) < limit:
-                variables: dict = {"first": page_size}
-                if cursor:
-                    variables["after"] = cursor
+            async with _openneuro_circuit_breaker:
+                while len(records) < limit:
+                    variables: dict = {"first": page_size}
+                    if cursor:
+                        variables["after"] = cursor
 
-                logger.debug(
-                    "OpenNeuro fetch: cursor=%s page_size=%d", cursor, page_size
-                )
+                    logger.debug(
+                        "OpenNeuro fetch: cursor=%s page_size=%d", cursor, page_size
+                    )
 
-                resp = await self._client.post(
-                    OPENNEURO_GRAPHQL_URL,
-                    json={"query": DATASETS_QUERY, "variables": variables},
-                )
-                resp.raise_for_status()
-                body = resp.json()
+                    resp = await self._client.post(
+                        OPENNEURO_GRAPHQL_URL,
+                        json={"query": DATASETS_QUERY, "variables": variables},
+                    )
+                    resp.raise_for_status()
+                    body = resp.json()
 
-                if "errors" in body:
-                    logger.error("OpenNeuro GraphQL errors: %s", body["errors"])
-                    break
-
-                connection = body.get("data", {}).get("datasets", {})
-                edges = connection.get("edges", [])
-                page_info = connection.get("pageInfo", {})
-
-                for edge in edges:
-                    node = edge.get("node", {})
-                    records.append(node)
-                    if len(records) >= limit:
+                    if "errors" in body:
+                        logger.error("OpenNeuro GraphQL errors: %s", body["errors"])
                         break
 
-                if not page_info.get("hasNextPage") or not edges:
-                    break
-                cursor = page_info.get("endCursor")
+                    connection = body.get("data", {}).get("datasets", {})
+                    edges = connection.get("edges", [])
+                    page_info = connection.get("pageInfo", {})
+
+                    for edge in edges:
+                        node = edge.get("node", {})
+                        records.append(node)
+                        if len(records) >= limit:
+                            break
+
+                    if not page_info.get("hasNextPage") or not edges:
+                        break
+                    cursor = page_info.get("endCursor")
 
         except httpx.HTTPStatusError as exc:
             logger.error(
@@ -133,6 +142,8 @@ class OpenNeuroConnector(BaseConnector):
             )
         except httpx.RequestError as exc:
             logger.error("OpenNeuro API request failed: %s", exc)
+        except CircuitBreakerOpenError as exc:
+            logger.warning("OpenNeuro API circuit is open: %s", exc)
         finally:
             if self._owns_client:
                 await self._client.aclose()

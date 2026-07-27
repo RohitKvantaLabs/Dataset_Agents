@@ -10,8 +10,17 @@ from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import get_settings
+from app.core.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger("neuro_platform.llm")
+
+# Module-level circuit breaker for LLM calls.
+# 5 failures within 30s → open circuit for 30s of fast-fail.
+_llm_circuit_breaker = CircuitBreaker(
+    name="groq-llm",
+    failure_threshold=5,
+    recovery_timeout=30.0,
+)
 
 
 class LLMJSONParseError(Exception):
@@ -46,13 +55,17 @@ class LLMClient:
         Uses Groq's JSON mode (response_format={"type": "json_object"}) to
         enforce structured output. The prompt must still instruct the model
         to produce JSON — Groq's JSON mode requires it.
+
+        Circuit breaker wraps the ENTIRE call (including tenacity retries)
+        so that a known-down LLM is fast-failed without exhausting retries.
         """
-        raw = self._chat(
-            system_prompt,
-            user_prompt,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-        )
+        with _llm_circuit_breaker:
+            raw = self._chat(
+                system_prompt,
+                user_prompt,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
             return json.loads(cleaned)

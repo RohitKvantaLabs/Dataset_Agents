@@ -10,8 +10,16 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import get_settings
+from app.core.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
 
 logger = logging.getLogger("neuro_platform.agents.search_provider")
+
+# Module-level circuit breaker for Tavily search.
+_tavily_circuit_breaker = CircuitBreaker(
+    name="tavily-search",
+    failure_threshold=3,
+    recovery_timeout=30.0,
+)
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
@@ -65,8 +73,11 @@ class TavilySearchProvider(SearchProvider):
 
     async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
         try:
-            data = await self._call_tavily(query, max_results)
-        except httpx.HTTPError as exc:
+            # Circuit breaker wraps the ENTIRE retry-attempt call so that a
+            # known-down Tavily is fast-failed without exhausting 3 retries.
+            async with _tavily_circuit_breaker:
+                data = await self._call_tavily(query, max_results)
+        except (httpx.HTTPError, CircuitBreakerOpenError) as exc:
             # Search failing should degrade the Fallback Agent to LLM-only
             # candidates, not crash the whole fallback-search request.
             logger.warning("Tavily search failed for %r: %s", query, exc)
