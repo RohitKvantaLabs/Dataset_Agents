@@ -10,6 +10,7 @@ The JSON object must have exactly these keys, in this order:
 - modality: array of strings. Empty array if not mentioned.
 - species: array of strings. Empty array if not mentioned.
 - age_range: string or null. Null if not mentioned.
+- region: string or null. Null if not mentioned.
 - condition: array of strings. Empty array if not mentioned.
 - task: string or null. Null if not mentioned.
 - format: array of strings. Empty array if not mentioned.
@@ -25,6 +26,10 @@ CANONICALIZATION RULES (always normalize to these forms, never invent new spelli
 - age_range: one of "pediatric" (age < 18), "adult" (18-65), "geriatric" (65+), or an explicit numeric \
   range "X-Y" if given in the query. Map "kids"/"children"/"infants"/"adolescents"→"pediatric"; \
   "elderly"/"older adults"→"geriatric".
+- region: lowercase anatomical region name — "hippocampus", "amygdala", "cerebellum", "thalamus", \
+  "striatum", "prefrontal cortex", "motor cortex", "visual cortex", "brainstem", "basal ganglia", \
+  "insula", "caudate", "putamen", "cingulate", "corpus callosum", "hypothalamus". Extract only \
+  when the query explicitly names a brain region. Use the standard anatomical name, lowercase.
 - format: "BIDS", "NIfTI", "DICOM", "EDF", "CSV". Map "brain imaging data structure"→"BIDS".
 - condition: use the researcher's own clinical term as stated (e.g. "ADHD", "Alzheimer's", "autism \
   spectrum disorder"), do not abbreviate or expand acronyms they didn't use. Use "healthy control" \
@@ -34,8 +39,8 @@ DISAMBIGUATION RULES:
 - task vs condition: "task" is what the subject was DOING during data collection (e.g. \
   "resting-state", "working memory task", "visual oddball"). "condition" is a clinical/diagnostic \
   group. Never put a diagnosis in "task" or an activity in "condition".
-- keywords: only for meaningful search terms that do NOT fit any typed field above (e.g. a specific \
-  brain region, a named study/consortium, a scanner field strength). Do not duplicate a value that \
+- keywords: only for meaningful search terms that do NOT fit any typed field above (e.g. a named \
+  study/consortium, a scanner field strength). Do not duplicate a value that \
   you already placed in a typed field.
 - Negation: if the query explicitly excludes a group (e.g. "excluding smokers", "no history of \
   concussion"), prefix that value with "NOT " inside the relevant array (e.g. condition: ["NOT \
@@ -49,20 +54,24 @@ STRICTNESS:
 
 EXAMPLES:
 
-Query: "resting state fMRI data in kids with ADHD, BIDS format"
-{"modality": ["fMRI"], "species": [], "age_range": "pediatric", "condition": ["ADHD"], \
+Query: "resting state fMRI in the hippocampus of kids with ADHD, BIDS format"
+{"modality": ["fMRI"], "species": [], "age_range": "pediatric", "region": "hippocampus", "condition": ["ADHD"], \
 "task": "resting-state", "format": ["BIDS"], "keywords": []}
 
 Query: "EEG datasets from healthy adult macaques, no seizure history"
-{"modality": ["EEG"], "species": ["macaque"], "age_range": "adult", "condition": ["healthy control", \
+{"modality": ["EEG"], "species": ["macaque"], "age_range": "adult", "region": null, "condition": ["healthy control", \
 "NOT seizure history"], "task": null, "format": [], "keywords": []}
 
+Query: "amygdala connectivity data from resting state fMRI"
+{"modality": ["fMRI"], "species": [], "age_range": null, "region": "amygdala", "condition": [], \
+"task": "resting-state", "format": [], "keywords": []}
+
 Query: "any DTI or structural scans from the ABCD study"
-{"modality": ["DTI", "sMRI"], "species": [], "age_range": null, "condition": [], "task": null, \
+{"modality": ["DTI", "sMRI"], "species": [], "age_range": null, "region": null, "condition": [], "task": null, \
 "format": [], "keywords": ["ABCD study"]}
 
 Query: "what's the weather today"
-{"modality": [], "species": [], "age_range": null, "condition": [], "task": null, "format": [], \
+{"modality": [], "species": [], "age_range": null, "region": null, "condition": [], "task": null, "format": [], \
 "keywords": []}
 """
 

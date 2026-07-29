@@ -75,6 +75,15 @@ class QueryUnderstandingAgent:
         elif any(term in text for term in ["adult", "adults"]):
             age_range = "adult"
 
+        region = None
+        for candidate in ["hippocampus", "amygdala", "cerebellum", "thalamus", "striatum",
+                          "prefrontal cortex", "motor cortex", "visual cortex", "brainstem",
+                          "basal ganglia", "insula", "caudate", "putamen", "cingulate",
+                          "corpus callosum", "hypothalamus"]:
+            if candidate in text:
+                region = candidate
+                break
+
         condition = [
             label
             for label in ["adhd", "alzheimer", "dementia", "autism", "parkinson", "depression"]
@@ -93,6 +102,7 @@ class QueryUnderstandingAgent:
             modality=modalities,
             species=[species] if species else [],
             age_range=age_range,
+            region=region,
             condition=condition,
             task=task,
             format=formats,
