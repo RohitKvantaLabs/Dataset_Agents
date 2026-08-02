@@ -41,4 +41,9 @@ async def ensure_indexes() -> None:
         name="dataset_text_search",
     )
 
+    # Phase 2 (§2.14) — repository retrieval publication indexes (additive).
+    await collection.create_index([("doi", 1)], name="doi_lookup", sparse=True)
+    await collection.create_index([("provenance.harvested_at", -1)], name="provenance_harvested")
+    await collection.create_index([("access_tier", 1)], name="access_tier_filter")
+
     logger.info("MongoDB indexes verified/created on collection=%s", COLLECTION_NAME)

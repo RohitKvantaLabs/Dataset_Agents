@@ -1,3 +1,12 @@
+# ============================================================================
+# NOTE (2026-08-01, Phase 4 §4.9): this scratch file documents the ORIGINAL
+# pre-refactor dataset schema and terminal archaeology from 2026-07. It is NOT
+# executable and is kept as history. The current schemas live in:
+#   Neuro-Agents/app/models/dataset.py            (common Dataset — incl. the
+#     six P4-1 display fields: region, age_group, disease, access_tier, doi,
+#     size_label, plus provenance)
+#   Neuro-Agents/app/models/repository_dataset.py (RepositoryDataset §2.2)
+# ============================================================================
 # const datasetSchema = new mongoose.Schema({
 #   title: { type: String, required: true },
 #   description: { type: String, required: true },

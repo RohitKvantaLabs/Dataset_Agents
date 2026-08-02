@@ -65,6 +65,65 @@ class Settings(BaseSettings):
     CRON_STALE_THRESHOLD_DAYS: int = 30
     CRON_BATCH_SIZE: int = 100
 
+    # ── Phase 2 — Repository Retrieval Architecture (§3.8 config, subset used by Phase 2) ──
+    REPOSITORY_ENABLED_SOURCES: list[str] = [
+        "openneuro", "dandi", "neurovault", "ebrains",
+        "zenodo", "figshare", "dryad", "osf", "nitrc",
+    ]
+    REPO_RATE_LIMIT_PER_SOURCE: float = 2.0   # default req/s per connector (§2.3.1)
+    REPO_MAX_PAGES: int = 5                    # pagination cap per connector (§2.3.1)
+    REPO_SEARCH_LIMIT_PER_SOURCE: int = 10     # default records per source in repository-search
+
+    # EBRAINS Knowledge Graph API key (bearer). Optional — when missing the
+    # ebrains connector returns an offline status with a reason instead of
+    # being skipped silently (§2.7).
+    EBRAINS_API_KEY: str | None = None
+
+    @field_validator("REPOSITORY_ENABLED_SOURCES", mode="before")
+    @classmethod
+    def split_enabled_sources(cls, v):
+        """Accept both JSON array (pydantic-settings default) and comma-sep string."""
+        if isinstance(v, str):
+            return [s.strip().lower() for s in v.split(",") if s.strip()]
+        return v
+
+    # ── Phase 3 — Dataset Quality Pipeline (§3.8) ──
+    # Stage 1 allow/block lists. Empty allowlist means "auto-derive" from
+    # each enabled source's canonical host + KNOWN_REPOSITORY_DOMAINS (§3.1).
+    REPOSITORY_ALLOWLIST: list[str] = []
+    REPOSITORY_BLOCKLIST: list[str] = []
+
+    # Stage 2 — classifier
+    ALLOW_SOFTWARE: bool = False            # False → software candidates dropped
+
+    # Stage 3 — metadata enrichment
+    ENRICHMENT_ENABLED: bool = True
+    CROSSREF_TIMEOUT_MS: int = 5000
+
+    # Stage 4 — download verification
+    MAX_CONCURRENT_CHECKS: int = 10         # semaphore, mirrors cron concurrency
+
+    # Stage 5 — quality scoring
+    SCORING_SCHEME: str = "legacy"          # "legacy" | "extended" (§3.5 optional)
+    ENRICH_QUALITY_BONUS_CAP: float = 0.15  # extended scheme bonus cap (+0.04 × 6 fields)
+
+    # Stage 6 — deduplication
+    DEDUP_URL_NORMALIZE: bool = True
+    DEDUP_DOI: bool = True
+    DEDUP_TITLE_SIM: float = 0.95           # Jaccard threshold for title merges
+
+    # Stage 7 — provenance & publication
+    PUBLISH_CHUNK_SIZE: int = 100           # matches bulk_upsert chunking
+    PIPELINE_VERSION: str = "v2"
+
+    @field_validator("REPOSITORY_ALLOWLIST", "REPOSITORY_BLOCKLIST", mode="before")
+    @classmethod
+    def split_host_lists(cls, v):
+        """Accept both JSON array (pydantic-settings default) and comma-sep string."""
+        if isinstance(v, str):
+            return [h.strip().lower() for h in v.split(",") if h.strip()]
+        return v
+
 
 @lru_cache
 def get_settings() -> Settings:
