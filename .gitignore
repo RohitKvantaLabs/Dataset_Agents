@@ -23,6 +23,8 @@ venv/
 .venv/
 .venv-clean/
 
+
+
 *.env
 
 # IDE/editor settings
