@@ -1,8 +1,15 @@
 """
 Verification Agent — deterministic, no LLM calls ever.
 
-Every candidate URL produced by the Fallback Agent passes through here
-before it is stored in Mongo or shown to a user. Three checks:
+This module is the link-check core of the quality pipeline's Stage 4
+(``app/ingestion/quality_pipeline.py::_stage_verify``), which imports
+``_check_link`` and the direct-link / non-dataset helpers. Its ``verify()``
+method remains available as a standalone web-candidate verifier (used by
+``test_verification_agent.py``), but the production fallback path now routes
+web candidates through the full 7-stage pipeline — Stage 4 derives trust from
+the verified destination URL + validated metadata, never from ``source_guess``.
+
+Checks provided here:
   1. URL liveness (HEAD → GET fallback)
   2. In-batch deduplication (seen_urls set)
   3. Domain trust-tier annotation (known repositories get a log note)

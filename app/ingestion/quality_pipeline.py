@@ -19,6 +19,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -41,13 +42,25 @@ from app.data.vocab import (
     REGION_TERMS,
     SPECIES_VOCAB,
 )
-from app.db.repositories.dataset_repository import bulk_upsert
+from app.db.repositories.dataset_repository import (
+    bulk_upsert,
+    normalize_doi,
+    normalize_url_key,
+)
 from app.ingestion.scorer import score_dataset
 from app.models.dataset import Dataset, TrustTier
 from app.models.query_filters import QueryFilters
 from app.models.repository_dataset import RepositoryDataset
 
 logger = logging.getLogger("neuro_platform.ingestion.quality_pipeline")
+
+# Canonical source label for web-origin candidates (FallbackAgent/Tavily+LLM).
+# Web candidates run the SAME 7-stage pipeline as repository candidates (§3.0);
+# Stage 1 allows them without the repository allowlist, and Stage 4 derives
+# trust from the verified destination URL + validated metadata — never from
+# source_guess alone. When the verified URL resolves to a supported repository
+# domain, the candidate is remapped to that repository source (§4.4 decision).
+WEB_DISCOVERY_SOURCE: str = "web_search"
 
 # §2.17 static per-source access-tier lookup (no LLM). A record-level value
 # declared by the connector always wins over this default.
@@ -131,6 +144,11 @@ class _Record:
     is_direct_link: bool = False
     last_verified_at: datetime | None = None
     dataset: Dataset | None = None
+    # Origin discovery source captured at pool build time (BEFORE Stage 4 can
+    # promote a web candidate to a repository source). Recorded in the Stage 7
+    # provenance discovery event so "found from Web Search then promoted to
+    # OpenNeuro" stays faithful to how the dataset actually entered the system.
+    origin_source: str = ""
 
 
 # ───────────────────────────── helpers ─────────────────────────────
@@ -195,7 +213,15 @@ def _match_vocab_token(text: str, terms: list[str]) -> str | None:
 
 
 def _stage_filter(records: list[_Record], settings) -> tuple[list[_Record], StageStats]:
-    """§3.1 — accept only curated, enabled, allowlisted sources with required fields."""
+    """§3.1 — accept only curated, enabled, allowlisted sources with required fields.
+
+    Web-origin candidates (``WEB_DISCOVERY_SOURCE``) are distinguished from
+    repository-origin candidates: they are allowed through the source/allowlist
+    gates (they originate outside the repository allowlist by definition) but
+    still pass the blocklist and required-field checks. Trust for web candidates
+    is derived in Stage 4 from the verified destination URL + validated metadata,
+    not from ``source_guess``.
+    """
     stats = StageStats()
     enabled = {s.lower() for s in settings.REPOSITORY_ENABLED_SOURCES}
     allowlist = _effective_allowlist(settings)
@@ -204,20 +230,22 @@ def _stage_filter(records: list[_Record], settings) -> tuple[list[_Record], Stag
     kept: list[_Record] = []
     for rec in records:
         c = rec.candidate
-        # 1) source ∈ REPOSITORY_ENABLED_SOURCES
-        if c.source not in enabled:
+        is_web = c.source == WEB_DISCOVERY_SOURCE
+        # 1) source allowed: repository-origin must be enabled; web-origin is allowed
+        if not is_web and c.source not in enabled:
             stats.drop("source_disabled")
             continue
-        # 2) URL host ∈ REPOSITORY_ALLOWLIST
+        # 2) URL host allowlist: repository-origin only (web candidates are not
+        #    rejected for originating outside the repository allowlist)
         host = _host_of(c.url)
-        if not host or host not in allowlist:
+        if not is_web and (not host or host not in allowlist):
             stats.drop("domain_not_allowlisted")
             continue
-        # 3) URL host ∈ REPOSITORY_BLOCKLIST
+        # 3) URL host ∈ REPOSITORY_BLOCKLIST — applies to all origins
         if host in blocklist:
             stats.drop("blocklisted")
             continue
-        # 4) missing required fields
+        # 4) missing required fields — applies to all origins
         if not c.source_id or not c.url or not c.title:
             stats.drop("missing_required")
             continue
@@ -438,8 +466,52 @@ async def _stage_enrich(records: list[_Record], settings) -> tuple[list[_Record]
 # ───────────────────────────── Stage 4 — Verify ─────────────────────────────
 
 
+# §3.4 — supported-repository URL → (source, source_id) extractors. Used to
+# promote a verified web candidate whose destination URL belongs to one of the
+# nine supported repositories into a repository dataset. When no pattern
+# matches, the SHA-1 source_id derived at discovery is kept (persistence-level
+# canonical merge still unifies the record).
+_REPO_URL_ID_PATTERNS: tuple[tuple[str, re.Pattern, Callable[[re.Match], str]], ...] = (
+    ("openneuro", re.compile(r"^https?://(?:www\.)?openneuro\.org/datasets/([^/?#]+)"), lambda m: m.group(1)),
+    ("dandi", re.compile(r"^https?://(?:www\.)?dandiarchive\.org/dandiset/(\d+)"), lambda m: f"DANDI:{int(m.group(1)):06d}"),
+    ("neurovault", re.compile(r"^https?://(?:www\.)?neurovault\.org/collections/(\d+)"), lambda m: m.group(1)),
+    ("ebrains", re.compile(r"^https?://search\.kg\.ebrains\.eu/instances/([^/?#]+)"), lambda m: m.group(1)),
+    ("zenodo", re.compile(r"^https?://(?:www\.)?zenodo\.org/records/(\d+)"), lambda m: m.group(1)),
+    ("figshare", re.compile(r"^https?://(?:www\.)?figshare\.com/articles/(?:dataset/)?(?:[^/?#]+/)?([^/?#]+)/?$"), lambda m: m.group(1)),
+    ("dryad", re.compile(r"^https?://(?:www\.)?datadryad\.org/stash/dataset/([^?#]+)"), lambda m: m.group(1).rstrip("/").split("/")[-1]),
+    ("osf", re.compile(r"^https?://osf\.io/([^/?#]+)"), lambda m: m.group(1)),
+    ("nitrc", re.compile(r"^https?://(?:www\.)?nitrc\.org/projects/([^/?#]+)"), lambda m: m.group(1)),
+)
+
+
+def _repo_identity_from_url(url: str) -> tuple[str, str] | None:
+    """
+    Derive a supported repository (source, source_id) from a verified URL.
+
+    Returns ``(source, native_id)`` when the URL encodes a supported
+    repository dataset id, ``(source, "")`` when the host is a supported
+    repository but no native id can be extracted (keep the SHA-1 id), or
+    ``None`` when the URL is not a supported repository dataset URL.
+    """
+    if not url:
+        return None
+    for source, pattern, idfn in _REPO_URL_ID_PATTERNS:
+        m = pattern.match(url)
+        if m:
+            return source, idfn(m)
+    host = _host_of(url)
+    for source, canonical in SOURCE_HOSTS.items():
+        if host == canonical or host.endswith("." + canonical):
+            return source, ""
+    return None
+
+
 async def _stage_verify(records: list[_Record], settings) -> tuple[list[_Record], StageStats]:
-    """§3.4 — parallel link check (reuse VerificationAgent), trust + direct-link."""
+    """§3.4 — parallel link check (reuse VerificationAgent), trust + direct-link.
+
+    Trust is derived from the verified destination URL + validated metadata:
+    web-origin candidates are never trusted because of ``source_guess``.
+    """
     stats = StageStats()
     agent = VerificationAgent()
     sem = asyncio.Semaphore(max(1, int(getattr(settings, "MAX_CONCURRENT_CHECKS", 10))))
@@ -447,7 +519,7 @@ async def _stage_verify(records: list[_Record], settings) -> tuple[list[_Record]
     try:
         async def check(rec: _Record):
             async with sem:
-                return rec, await agent._check_link(rec.candidate.url)  # noqa: SLF001
+                return await agent._check_link(rec.candidate.url)  # noqa: SLF001
 
         results = await asyncio.gather(*[check(r) for r in records], return_exceptions=True)
 
@@ -456,7 +528,7 @@ async def _stage_verify(records: list[_Record], settings) -> tuple[list[_Record]
                 stats.drop("dead_link")
                 logger.info("Stage 4 link check raised for %s: %s", rec.candidate.url, result)
                 continue
-            is_live, domain, response = result
+            is_live, _, response = result
             if not is_live:
                 stats.drop("dead_link")
                 logger.info("Stage 4 dead link: %s", rec.candidate.url)
@@ -474,9 +546,32 @@ async def _stage_verify(records: list[_Record], settings) -> tuple[list[_Record]
             rec.is_direct_link = direct
             rec.last_verified_at = datetime.now(timezone.utc)
 
-            # Rule 3: repository sources are already allowlisted — the
-            # repository itself guarantees the dataset (known domain).
-            known = domain in KNOWN_REPOSITORY_DOMAINS or rec.candidate.source in REPOSITORY_SOURCE_KEYS
+            # Web-origin candidates whose verified destination URL belongs to a
+            # supported repository domain become repository datasets (approved
+            # decision). Runs before the trust check below, so the remapped
+            # record is treated as a known repository source.
+            if rec.candidate.source == WEB_DISCOVERY_SOURCE:
+                repo_identity = _repo_identity_from_url(rec.candidate.url)
+                if repo_identity is not None:
+                    repo_source, native_id = repo_identity
+                    rec.candidate.source = repo_source
+                    if native_id:
+                        rec.candidate.source_id = native_id
+                    rec.reclassified = True
+                    # Promoted: the supported repository itself guarantees the
+                    # record is a dataset (rule 3, §3.4) — no path-marker or
+                    # direct-link heuristic needed.
+                    rec.class_label = "dataset"
+                    logger.info(
+                        "Stage 4 remapped web candidate to repository source=%s source_id=%s url=%s",
+                        rec.candidate.source, rec.candidate.source_id, rec.candidate.url,
+                    )
+
+            # Trust from the verified (post-redirect) destination URL:
+            # repository sources are allowlisted / known domains — the
+            # repository itself guarantees the dataset.
+            final_domain = _host_of(rec.candidate.url)
+            known = final_domain in KNOWN_REPOSITORY_DOMAINS or rec.candidate.source in REPOSITORY_SOURCE_KEYS
             if not direct and not known:
                 stats.drop("unverifiable")
                 logger.info("Stage 4 unverifiable landing page: %s", rec.candidate.url)
@@ -594,37 +689,6 @@ def _stage_score(records: list[_Record], settings) -> tuple[list[_Record], Stage
 # ───────────────────────────── Stage 6 — Dedup ─────────────────────────────
 
 
-def _normalize_url_key(url: str) -> str:
-    """§3.6 key 2 — lowercase host, http/https merged, strip www., trailing /, query, fragment."""
-    try:
-        p = urlparse(url)
-        host = (p.hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        path = (p.path or "").rstrip("/")
-        return f"http://{host}{path}"
-    except Exception:  # noqa: BLE001
-        return (url or "").lower().strip().rstrip("/")
-
-
-def _normalize_doi(doi: str | None) -> str | None:
-    """§3.6 key 3 — case-insensitive, strip common DOI prefixes."""
-    if not doi:
-        return None
-    d = doi.strip().lower()
-    for prefix in (
-        "https://doi.org/",
-        "http://doi.org/",
-        "https://dx.doi.org/",
-        "http://dx.doi.org/",
-        "doi:",
-    ):
-        if d.startswith(prefix):
-            d = d[len(prefix):]
-            break
-    return d or None
-
-
 def _title_tokens(title: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", (title or "").lower()))
 
@@ -646,9 +710,9 @@ def _identity_keys(rec: _Record, settings) -> dict[str, str]:
     c = rec.candidate
     keys["source_id"] = f"{c.source}:{c.source_id}"
     if settings.DEDUP_URL_NORMALIZE and c.url:
-        keys["url"] = _normalize_url_key(c.url)
+        keys["url"] = normalize_url_key(c.url)
     if settings.DEDUP_DOI and c.doi:
-        d = _normalize_doi(c.doi)
+        d = normalize_doi(c.doi)
         if d:
             keys["doi"] = d
     return keys
@@ -737,8 +801,18 @@ def _stage_dedup(records: list[_Record], settings) -> tuple[list[_Record], Stage
 # ───────────────────────────── Stage 7 — Publish ─────────────────────────────
 
 
-def _build_provenance(rec: _Record, settings, harvest_query: str) -> dict:
-    """§3.7 — full provenance record (answers where/when/which query/version)."""
+def _build_provenance(rec: _Record, settings, harvest_query: str, discovery_method: str) -> dict:
+    """§3.7 — full provenance record (answers where/when/which query/version).
+
+    Latest-snapshot fields (source_repository, source_api, harvest_query,
+    harvested_at, pipeline_version, enrichment_sources, dedup_key, enrichment)
+    are preserved for backward compatibility, PLUS an append-only
+    ``discovery_history`` recording THIS discovery event (origin source,
+    discovery method, source API, harvest query, harvested timestamp, pipeline
+    version) and top-level ``first_seen_at`` / ``last_seen_at`` /
+    ``discovery_count`` for cheap querying. The persistence layer merges
+    history across repeated discoveries (FIFO-capped) rather than overwriting.
+    """
     now = datetime.now(timezone.utc)
     enrichment = {
         "sources": sorted(set(rec.enrichment_sources)),
@@ -747,20 +821,34 @@ def _build_provenance(rec: _Record, settings, harvest_query: str) -> dict:
     }
     if rec.enrichment:
         enrichment["status"] = dict(rec.enrichment)
+    source = rec.candidate.source
+    source_api = _host_of(rec.candidate.url)
+    event = {
+        "source": rec.origin_source or source,
+        "discovery_method": discovery_method,
+        "source_api": source_api,
+        "harvest_query": harvest_query,
+        "harvested_at": now.isoformat(),
+        "pipeline_version": settings.PIPELINE_VERSION,
+    }
     return {
-        "source_repository": rec.candidate.source,
-        "source_api": _host_of(rec.candidate.url),
+        "source_repository": source,
+        "source_api": source_api,
         "harvest_query": harvest_query,
         "harvested_at": now.isoformat(),
         "pipeline_version": settings.PIPELINE_VERSION,
         "enrichment_sources": sorted(set(rec.enrichment_sources)),
-        "dedup_key": f"{rec.candidate.source}:{rec.candidate.source_id}",
+        "dedup_key": f"{source}:{rec.candidate.source_id}",
         "enrichment": enrichment,
+        "first_seen_at": now.isoformat(),
+        "last_seen_at": now.isoformat(),
+        "discovery_count": 1,
+        "discovery_history": [event],
     }
 
 
 async def _stage_publish(
-    records: list[_Record], settings, harvest_query: str
+    records: list[_Record], settings, harvest_query: str, discovery_method: str
 ) -> tuple[list[Dataset], StageStats, list[str]]:
     """§3.7 — attach provenance, drop raw, atomic bulk upsert on (source, source_id)."""
     stats = StageStats()
@@ -770,7 +858,7 @@ async def _stage_publish(
     for rec in records:
         if rec.dataset is None:
             continue
-        rec.dataset.provenance = _build_provenance(rec, settings, harvest_query)
+        rec.dataset.provenance = _build_provenance(rec, settings, harvest_query, discovery_method)
         datasets.append(rec.dataset)
 
     if not datasets:
@@ -798,20 +886,36 @@ async def run_quality_pipeline(
     filters: QueryFilters | None = None,
     *,
     publish: bool = True,  # Stage 7 (False for pure retrieval previews)
+    discovery_method: str | None = None,  # batch_sync | repository_search | web_search
 ) -> PipelineRunResult:
     """
     Run the 7-stage quality pipeline over an aggregated candidate pool.
 
     Every stage is wrapped so an unexpected crash is logged and recorded
     without aborting the remaining records or the run itself.
+
+    ``discovery_method`` labels the provenance discovery event (Stage 7):
+    ``batch_sync`` (repository sync/cron), ``repository_search`` (online
+    repository retrieval), or ``web_search`` (fallback web discovery). When
+    omitted it is inferred from the pool: ``web_search`` if any candidate
+    originated from web discovery, else ``repository_search``.
     """
     start = time.monotonic()
     settings = get_settings()
     result = PipelineRunResult()
     harvest_query = filters.raw_query if filters else ""
 
+    if discovery_method is None:
+        discovery_method = (
+            "web_search"
+            if any(c.source == WEB_DISCOVERY_SOURCE for c in candidates)
+            else "repository_search"
+        )
+
     records: list[_Record] = [
-        _Record(candidate=c) for c in candidates if isinstance(c, RepositoryDataset)
+        _Record(candidate=c, origin_source=c.source)
+        for c in candidates
+        if isinstance(c, RepositoryDataset)
     ]
 
     async def safe_stage(
@@ -867,7 +971,7 @@ async def run_quality_pipeline(
     # Stage 7 — Provenance & Publish (optional)
     if publish and records:
         try:
-            _, st, pub_errors = await _stage_publish(records, settings, harvest_query)
+            _, st, pub_errors = await _stage_publish(records, settings, harvest_query, discovery_method)
             result.stages["publish"] = st
             result.errors.extend(pub_errors)
             _log_stage("publish", st)

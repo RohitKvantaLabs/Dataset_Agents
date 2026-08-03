@@ -53,7 +53,7 @@ frontend connection (websocket/SSE session, request id, etc.) - Python does not 
 
 **Response `200`**
 ```json
-{ "query_id": "sess_abc123", "datasets_found": 3, "published": true, "datasets": [] }
+{ "query_id": "sess_abc123", "datasets_found": 3, "published": true, "datasets": [ ... ] }
 ```
 
 Node should use `datasets` as the user-facing result. Python also publishes the same payload to Redis for optional asynchronous consumers.
@@ -67,22 +67,39 @@ Python publishes to channel `fallback-result:{query_id}` (prefix configurable vi
     {
       "title": "...",
       "description": "...",
-      "source": "web_search",
-      "source_id": "...",
-      "url": "https://...",
-      "modality": [],
-      "species": [],
+      "source": "openneuro",
+      "source_id": "ds000001",
+      "url": "https://openneuro.org/datasets/ds000001",
+      "modality": ["fMRI"],
+      "species": ["human"],
       "is_direct_link": false,
-      "trust_tier": "unverified",
-      "last_verified_at": null,
-      "ingested_at": "2026-07-03T12:00:00Z",
-      "updated_at": "2026-07-03T12:00:00Z"
+      "trust_tier": "verified",
+      "last_verified_at": "2026-08-02T12:00:00Z",
+      "provenance": {
+        "source_repository": "openneuro", "harvest_query": "...", "pipeline_version": "v2",
+        "dedup_key": "openneuro:ds000001", "enrichment_sources": ["access_tier_static"],
+        "first_seen_at": "2026-08-02T12:00:00Z", "last_seen_at": "2026-08-02T12:00:00Z",
+        "discovery_count": 1,
+        "discovery_history": [
+          { "source": "openneuro", "discovery_method": "batch_sync", "source_api": "openneuro.org",
+            "harvest_query": "...", "harvested_at": "2026-08-02T12:00:00Z", "pipeline_version": "v2" }
+        ]
+      },
+      "ingested_at": "2026-08-02T12:00:00Z",
+      "updated_at": "2026-08-02T12:00:00Z"
     }
   ]
 }
 ```
 `datasets` can be an empty array - that's a valid "nothing found" outcome, not an error. Node
 should handle that in the UI rather than treating it as a failure.
+
+> **Web candidates run the 7-stage quality pipeline (one quality path, §3.0).**
+> `source` is `"web_search"` only for genuine web-discovered records. When the
+> verified destination URL resolves to one of the nine supported repositories
+> (openneuro, dandi, neurovault, ebrains, zenodo, figshare, dryad, osf, nitrc),
+> the record is promoted to that repository source with its repository-native
+> `source_id` (e.g. `openneuro:ds000001`, `dandi:DANDI:000003`).
 
 **Relevance filter (applied before any network check):** candidates whose title or URL contain
 spec/documentation signals (`specification`, `documentation`, `changelog`, `manual`, `user guide`,
@@ -94,21 +111,26 @@ they are filtered before the link-liveness check runs, not just ranked lower.
 extension, `Content-Type: application/zip/octet-stream/…`, or `Content-Disposition: attachment`).
 `false` for repository landing pages. Node can use this to display a "Direct download" badge.
 
-**`trust_tier`:** newly-found candidates always arrive as `"unverified"`. The scheduled
-`/api/v1/cron/reverify-links` job re-checks live URLs and upgrades them to `"verified"` or
-downgrades to `"stale"`. Node should not display `"stale"` links to users without a warning.
+**`trust_tier`:** every candidate that survives the quality pipeline's Stage 4 link check is
+persisted as `"verified"` (the liveness check at discovery time is the verification). The
+scheduled `/api/v1/cron/reverify-links` job keeps re-checking URLs and marks dead links
+`"stale"`. Node should not display `"stale"` links to users without a warning.
 
-These same datasets are also upserted into Mongo (`datasets` collection, keyed on
-`source + source_id`) at the same time, so the next identical query is a cache hit on Node's side.
+These same datasets are also persisted into Mongo (`datasets` collection) by the pipeline's
+Stage 7, but only after passing all validation stages, and **idempotently**: writes are keyed
+on `(source, source_id)` and additionally merge into the existing canonical record when the
+normalized URL or DOI already exists under a different identity (e.g. a dataset discovered
+both via a connector and via the web is stored once, refreshed). Repeated searches or syncs
+never duplicate a dataset. Node can therefore re-query Mongo after a fallback search and
+pick up the net-new records (`source:source_id` diff, Option A contract).
 
 ---
 
 ## Open items before this is production-ready
-- Fallback Agent has no real web-search provider wired in yet (`app/agents/search_provider.py`) -
-  currently LLM-only guesses, verified by the Verification Agent's link check. Needs a real
-  provider (Tavily/Serper/Bing) before Phase 2 fallback quality is trustworthy.
 - Confirm Vercel plan supports the `maxDuration: 60` set in `vercel.json` for the fallback
-  endpoint - LLM + verification can take a while.
+  endpoint - LLM + quality pipeline (incl. Stage 4 link checks) can take a while.
+- The web-search provider IS wired: `app/agents/search_provider.py` implements the Tavily
+  provider (`TAVILY_API_KEY` is a required startup config).
 
 ---
 

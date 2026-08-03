@@ -35,8 +35,15 @@ end-user-facing routes, and it is not where the frontend talks to directly. Node
 Python owns:
 - Turning natural language into structured filters (`QueryUnderstandingAgent`)
 - Finding new datasets on the open web when Node's DB comes up empty (`FallbackAgent`)
-- Verifying those candidates are real and reachable before anything is trusted (`VerificationAgent`)
-- Writing newly-found datasets back to Mongo (write-only from this service's perspective)
+- Running BOTH discovery sources (repository connectors and web candidates) through the
+  SAME 7-stage quality pipeline (`app/ingestion/quality_pipeline.py`: Filter → Classify →
+  Enrich → Verify → Score → Dedup → Publish). Web candidates are allowed through Stage 1
+  without the repository allowlist, and Stage 4 derives trust from the verified destination
+  URL + validated metadata — never from `source_guess`. Web candidates whose verified URL
+  resolves to a supported repository domain are promoted to that repository source.
+- Writing validated datasets back to Mongo idempotently (write-only from this service's
+  perspective): the (source, source_id) upsert plus a canonical URL/DOI merge guarantee one
+  record per dataset regardless of discovery source.
 - Publishing the result to Redis so Node can push it to the user
 
 If you're about to add an endpoint the frontend would call directly, or a read-heavy search
@@ -58,6 +65,12 @@ These aren't style preferences — violating them will cause real production bug
    single atomic `find_one_and_update(upsert=True)` keyed on `(source, source_id)`. There is
    also a unique index on that pair (`scripts/ensure_indexes.py`) as a hard backstop. Do not
    "optimize" this into a `find()` followed by an `insert()`.
+   **Canonical-merge exception (stabilization):** before writing, `upsert_dataset`/`bulk_upsert`
+   resolve each dataset's normalized URL/DOI against existing documents and RE-TARGET the write
+   to the existing canonical (source, source_id) so a dataset discovered via multiple sources
+   (connector + web + mirrors) is refreshed, never duplicated. The unique index on
+   `(source, source_id)` remains the backstop; the canonical lookup is an optimization of the
+   write target, not a replacement for the atomic upsert.
 
 3. **Every Node-facing endpoint requires the `X-Internal-Secret` header.** See
    `app/core/security.py`. This is a cost control (every call can trigger a paid-eventually LLM
@@ -99,37 +112,51 @@ neuro-data-platform/
 │   ├── config.py                       # Settings — all env vars, read once via lru_cache
 │   │
 │   ├── api/v1/
-│   │   ├── router.py                   # aggregates health + agents routers
+│   │   ├── router.py                   # aggregates health + agents + repositories + cron routers
 │   │   ├── health.py                   # GET /health — checks Mongo reachability
-│   │   └── agents.py                   # POST /agents/parse-query, POST /agents/fallback-search
+│   │   ├── agents.py                   # POST /agents/parse-query, POST /agents/fallback-search
+│   │   ├── repositories.py             # repository-search / repository-sync / repository-health
+│   │   └── cron.py                     # /cron/reverify-links, /cron/ingest-repositories
 │   │
 │   ├── agents/
 │   │   ├── query_understanding_agent.py  # blocking — raw text -> QueryFilters (1 LLM call)
 │   │   ├── fallback_agent.py             # web search + LLM -> candidate URLs (never a final answer)
-│   │   ├── verification_agent.py         # deterministic — link check, trust tier, dedupe
-│   │   └── search_provider.py            # SearchProvider interface — NOT wired to a real API yet
+│   │   ├── verification_agent.py         # deterministic link-check core — reused as pipeline Stage 4
+│   │   └── search_provider.py            # SearchProvider interface + Tavily-backed implementation
+│   │
+│   ├── connectors/                       # 9 repository connectors (openneuro … nitrc) with search()/fetch()
+│   ├── ingestion/
+│   │   ├── quality_pipeline.py           # 7-stage pipeline — ONE quality path for repo + web candidates
+│   │   ├── pipeline.py                   # batch sync: fetch → normalize_repository → quality pipeline
+│   │   ├── repository_sync.py            # run_repository_sync() wrapper (cron/admin triggers)
+│   │   ├── normalizer.py                 # raw → Dataset / RepositoryDataset mappers
+│   │   ├── scorer.py                     # score_dataset (4×0.25 rubric)
+│   │   └── embedder.py                   # optional HF embeddings (excluded from serialization)
 │   │
 │   ├── llm/
-│   │   ├── client.py                   # LLMClient — the ONLY place that calls huggingface_hub
+│   │   ├── client.py                   # LLMClient — the ONLY place that calls the provider SDK
 │   │   └── prompts.py                  # every system/user prompt template, kept out of agent logic
 │   │
 │   ├── db/
 │   │   ├── mongo.py                    # Motor client, lazy connect, serverless-safe
+│   │   ├── indexes.py                  # ensured on startup (unique (source, source_id), text, doi, …)
 │   │   └── repositories/
-│   │       └── dataset_repository.py   # upsert_dataset() — atomic, no read-then-write
+│   │       └── dataset_repository.py   # atomic upsert + canonical URL/DOI merge (no duplicates)
 │   │
 │   ├── services/
-│   │   └── redis_publisher.py          # publish_fallback_result() -> Node's subscribed channel
+│   │   ├── redis_publisher.py          # publish_fallback_result() -> Node's subscribed channel
+│   │   └── repository_retrieval.py     # aggregate_repository_search() — parallel connector pooling
 │   │
 │   ├── models/
 │   │   ├── dataset.py                  # Dataset — the common schema, also the Mongo document shape
+│   │   ├── repository_dataset.py       # RepositoryDataset — intermediate retrieval schema (§2.2)
 │   │   └── query_filters.py            # QueryFilters + the parse-query request/response models
 │   │
 │   ├── core/
 │   │   ├── security.py                 # require_internal_secret dependency
 │   │   └── exceptions.py               # UpstreamServiceError + global exception handlers
 │   │
-│   └── utils/                          # (empty — shared helpers land here as they're needed)
+│   └── data/vocab.py                   # controlled vocabularies (structure-only until approved lists)
 │
 ├── scripts/
 │   └── ensure_indexes.py               # run once against Atlas: unique index on (source, source_id)
@@ -138,6 +165,8 @@ neuro-data-platform/
 │   ├── conftest.py                     # shared fixtures (mock LLMClient, mock Mongo, etc.)
 │   ├── test_agents/                    # one test file per agent, LLM calls mocked
 │   ├── test_api/                       # endpoint tests via FastAPI TestClient
+│   ├── test_ingestion/                 # quality pipeline tests (web-origin handling)
+│   ├── test_db/                        # repository persistence tests (canonical merge)
 │   └── test_services/                  # redis_publisher, etc.
 │
 ├── .env.example                        # every required env var, documented

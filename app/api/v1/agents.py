@@ -1,17 +1,18 @@
+import hashlib
 import logging
 import time
 
 from fastapi import APIRouter, Depends
 
-from app.agents.fallback_agent import FallbackAgent
+from app.agents.fallback_agent import FallbackAgent, FallbackCandidate
 from app.agents.query_understanding_agent import QueryUnderstandingAgent
 from app.agents.search_provider import TavilySearchProvider
-from app.agents.verification_agent import VerificationAgent
 from app.config import get_settings
 from app.core.security import require_internal_secret
-from app.db.repositories.dataset_repository import upsert_many
+from app.ingestion.quality_pipeline import WEB_DISCOVERY_SOURCE, run_quality_pipeline
 from app.models.query_filters import ParseQueryRequest, ParseQueryResponse, QueryFilters
 from app.models.dataset import Dataset
+from app.models.repository_dataset import RepositoryDataset
 from app.services.redis_publisher import publish_fallback_result
 from pydantic import BaseModel
 
@@ -64,6 +65,48 @@ class FallbackSearchResponse(BaseModel):
     datasets: list[Dataset]
 
 
+def _web_candidate_to_repository_dataset(
+    candidate: FallbackCandidate, filters: QueryFilters
+) -> RepositoryDataset | None:
+    """
+    Bridge a web-discovery candidate into the quality pipeline's input schema.
+
+    Web-origin candidates always carry ``source=web_search`` (the canonical
+    web-discovery source label) — never ``source_guess``. The guess is preserved
+    in ``raw`` for provenance/debug only; trust is derived in Stage 4 from the
+    verified destination URL + validated metadata.
+    """
+    url = (candidate.url or "").strip()
+    if not url:
+        return None
+    title = (candidate.title or "Untitled dataset").strip() or "Untitled dataset"
+    source_id = hashlib.sha1(url.encode()).hexdigest()[:16]
+
+    modality = [m.lower() for m in filters.modality] if filters.modality else []
+    species = [s.lower() for s in filters.species] if filters.species else []
+    keywords: list[str] = []
+    if filters.condition:
+        keywords.extend(c.lower() for c in filters.condition)
+    if filters.task:
+        keywords.append(filters.task.lower())
+    if filters.format:
+        keywords.extend(f.lower() for f in filters.format)
+    if filters.keywords:
+        keywords.extend(k.lower() for k in filters.keywords)
+
+    return RepositoryDataset(
+        source=WEB_DISCOVERY_SOURCE,
+        source_id=source_id,
+        url=url,
+        title=title,
+        description=(candidate.reasoning or "Fallback candidate pending review"),
+        modality=modality,
+        species=species,
+        keywords=keywords,
+        raw={"source_guess": candidate.source_guess, "discovery": "web"},
+    )
+
+
 @router.post("/agents/fallback-search", response_model=FallbackSearchResponse)
 async def fallback_search(payload: FallbackSearchRequest):
     settings = get_settings()
@@ -72,24 +115,36 @@ async def fallback_search(payload: FallbackSearchRequest):
     fallback_agent = FallbackAgent(search_provider=TavilySearchProvider())
     candidates = await fallback_agent.discover(filters, max_candidates=settings.MAX_FALLBACK_CANDIDATES)
 
-    verification_agent = VerificationAgent()
-    verified_datasets: list[Dataset] = await verification_agent.verify(candidates, filters=filters)
-
-    if verified_datasets:
-        await upsert_many(verified_datasets)
+    # One quality path (§3.0): web candidates run the SAME 7-stage quality
+    # pipeline as repository candidates. Stage 1 allows web-origin records
+    # (blocklist + required fields; no repository allowlist); Stage 4 derives
+    # trust from the verified destination URL + validated metadata and promotes
+    # candidates that resolve to a supported repository domain into repository
+    # datasets. Stage 7 persists only validated records, idempotently, into the
+    # canonical record (URL/DOI merge). This handler still completes everything
+    # synchronously before returning (Vercel serverless constraint).
+    repo_candidates = [
+        ds
+        for ds in (_web_candidate_to_repository_dataset(c, filters) for c in candidates)
+        if ds is not None
+    ]
+    pipeline = await run_quality_pipeline(
+        repo_candidates, filters, publish=True, discovery_method="web_search"
+    )
+    datasets = pipeline.datasets
 
     await publish_fallback_result(
         payload.query_id,
         {
             "query_id": payload.query_id,
             "query": payload.query,
-            "datasets": [d.model_dump(mode="json") for d in verified_datasets],
+            "datasets": [d.model_dump(mode="json") for d in datasets],
         },
     )
 
     return FallbackSearchResponse(
         query_id=payload.query_id,
-        datasets_found=len(verified_datasets),
+        datasets_found=len(datasets),
         published=True,
-        datasets=verified_datasets,
+        datasets=datasets,
     )

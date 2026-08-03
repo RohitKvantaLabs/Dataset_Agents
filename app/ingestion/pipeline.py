@@ -117,7 +117,9 @@ async def run_pipeline(
     # Same quality path as online retrieval: filter, classify, enrich, verify,
     # score, dedup, and publish (atomic bulk upsert + provenance).
     if candidates:
-        pipeline_result = await run_quality_pipeline(candidates, publish=True)
+        pipeline_result = await run_quality_pipeline(
+            candidates, publish=True, discovery_method="batch_sync"
+        )
         result.upserted = pipeline_result.stages.get("publish", StageStats()).accepted
         result.errors += len(pipeline_result.errors)
         result.error_samples.extend(pipeline_result.errors[: max(0, 5 - len(result.error_samples))])

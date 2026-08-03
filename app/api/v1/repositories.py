@@ -82,7 +82,9 @@ async def repository_search(payload: RepositorySearchRequest) -> RepositorySearc
     for source in aggregate.sources_queried:
         _last_search_at[source] = time.time()
 
-    pipeline = await run_quality_pipeline(aggregate.records, filters, publish=False)
+    pipeline = await run_quality_pipeline(
+        aggregate.records, filters, publish=False, discovery_method="repository_search"
+    )
 
     return RepositorySearchResponse(
         query_id=uuid.uuid4().hex,

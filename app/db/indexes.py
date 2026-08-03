@@ -46,4 +46,14 @@ async def ensure_indexes() -> None:
     await collection.create_index([("provenance.harvested_at", -1)], name="provenance_harvested")
     await collection.create_index([("access_tier", 1)], name="access_tier_filter")
 
+    # Provenance discovery history (§3.7) — top-level counters are maintained
+    # for cheap querying; index the recency field so "recently re-discovered"
+    # analytics / admin queries use the index instead of a full scan.
+    await collection.create_index(
+        [("provenance.last_seen_at", -1)], name="provenance_last_seen"
+    )
+    await collection.create_index(
+        [("provenance.discovery_count", -1)], name="provenance_discovery_count"
+    )
+
     logger.info("MongoDB indexes verified/created on collection=%s", COLLECTION_NAME)

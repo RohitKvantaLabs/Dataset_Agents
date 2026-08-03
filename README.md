@@ -3,8 +3,9 @@
 The Python microservice in the Neuro Data Platform. It sits behind the Node.js API and does three things:
 
 1. **Parse query** (`POST /api/v1/agents/parse-query`) — Converts a researcher's natural-language question into structured `QueryFilters` that Node uses to query MongoDB.
-2. **Fallback search** (`POST /api/v1/agents/fallback-search`) — When MongoDB has no match, searches the open web (Tavily), verifies links, upserts results into MongoDB, and publishes to Redis so Node can push them to the frontend.
-3. **Health check** (`GET /api/v1/health`) — Reports MongoDB connectivity.
+2. **Fallback search** (`POST /api/v1/agents/fallback-search`) — When MongoDB has no match, discovers candidate URLs on the open web (Tavily + LLM) and runs them through the SAME 7-stage quality pipeline used by the repository connectors (Filter → Classify → Enrich → Verify → Score → Dedup → Publish). Only validated datasets are persisted — idempotently, into a single canonical record per dataset (URL/DOI merge) — and the result is published to Redis so Node can push it to the frontend.
+3. **Repository retrieval & sync** (`POST /api/v1/agents/repository-search`, `POST /api/v1/agents/repository-sync`, `GET /cron/ingest-repositories`) — Structured search and batch sync across nine repository connectors (openneuro, dandi, neurovault, ebrains, zenodo, figshare, dryad, osf, nitrc), all through the same quality pipeline.
+4. **Health check** (`GET /api/v1/health`) — Reports MongoDB connectivity.
 
 See [`NODE_INTEGRATION_CONTRACT.md`](./NODE_INTEGRATION_CONTRACT.md) for exact request/response shapes. See [`CLAUDE.md`](./CLAUDE.md) for architecture constraints (read before modifying anything).
 
@@ -209,7 +210,8 @@ Key constraints (full details in `CLAUDE.md`):
 | Constraint | Why |
 |---|---|
 | No `BackgroundTasks` / fire-and-forget | Vercel freezes the function on response send |
-| Atomic `find_one_and_update(upsert=True)` only | Two fallback workers can race on the same dataset |
+| Atomic `find_one_and_update(upsert=True)` + canonical URL/DOI merge | Two fallback workers can race on the same dataset; the same dataset can also be discovered from multiple sources — the canonical merge refreshes the existing record instead of duplicating it |
+| One 7-stage quality pipeline for repo AND web candidates | Consistency of trust/validation model; web candidates skip the repository allowlist but must pass verification, classification, scoring, dedup, and publish |
 | `X-Internal-Secret` on every endpoint | Each call may trigger a paid LLM call — cost control |
 | No LLM in `VerificationAgent` | Candidates must be independently verified, not LLM-trusted |
 | All LLM calls through `app/llm/client.py` | Provider swap is a single-file change (now uses Groq) |

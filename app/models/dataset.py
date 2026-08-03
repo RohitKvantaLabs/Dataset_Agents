@@ -48,8 +48,14 @@ class Dataset(BaseModel):
     quality_score: float | None = None      # set by the scorer in the ingestion pipeline
 
     provenance: dict | None = None
-    """§3.7 Stage 7 provenance record: source_repository, source_api,
-    harvest_query, harvested_at, pipeline_version, enrichment, dedup_key."""
+    """§3.7 Stage 7 provenance record. Latest-snapshot fields:
+    source_repository, source_api, harvest_query, harvested_at,
+    pipeline_version, enrichment, dedup_key — plus append-only
+    ``discovery_history`` (each discovery event: source, discovery_method,
+    source_api, harvest_query, harvested_at, pipeline_version; FIFO-capped at
+    20) and top-level ``first_seen_at`` / ``last_seen_at`` /
+    ``discovery_count`` for cheap querying. Merged across repeated discoveries
+    by the persistence layer (never overwritten)."""
 
     embedding: list[float] | None = Field(default=None, exclude=True)  # never serialize to API responses
 

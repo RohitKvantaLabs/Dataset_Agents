@@ -9,6 +9,9 @@ Covers (per CLAUDE.md checklist):
 - parse-query response shape matches NODE_INTEGRATION_CONTRACT.md exactly.
 - fallback-search response shape matches the contract.
 - fallback-search works with empty candidate list (no Mongo/Redis errors).
+- Web candidates run through the quality pipeline (publish=True) — one
+  quality path with repository candidates; only surviving datasets are
+  returned/published.
 
 All LLM calls, Mongo writes, Redis publishes, and HTTP link-checks are
 mocked — no real I/O in these tests.
@@ -17,6 +20,10 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+
+from app.agents.fallback_agent import FallbackCandidate
+from app.ingestion.quality_pipeline import PipelineRunResult
+from app.models.dataset import Dataset
 
 # conftest.py provides `client` and `auth_headers` fixtures
 
@@ -118,11 +125,10 @@ class TestParseQueryResponse:
 # POST /api/v1/agents/fallback-search
 # ---------------------------------------------------------------------------
 
-# We need to patch Mongo upsert and Redis publish so no real I/O fires.
+# We need to patch the quality pipeline and Redis publish so no real I/O fires.
 MOCK_PATCHES = [
-    "app.api.v1.agents.upsert_many",
+    "app.api.v1.agents.run_quality_pipeline",
     "app.api.v1.agents.publish_fallback_result",
-    "app.agents.verification_agent.VerificationAgent.verify",
     "app.agents.fallback_agent.FallbackAgent.discover",
 ]
 
@@ -171,9 +177,11 @@ class TestFallbackSearchResponse:
     ) -> None:
         with (
             patch("app.agents.fallback_agent.FallbackAgent.discover", new=AsyncMock(return_value=[])),
-            patch("app.agents.verification_agent.VerificationAgent.verify", new=AsyncMock(return_value=[])),
+            patch(
+                "app.api.v1.agents.run_quality_pipeline",
+                new=AsyncMock(return_value=PipelineRunResult(datasets=[], errors=[], elapsed_ms=4)),
+            ),
             patch("app.services.redis_publisher.get_redis"),
-            patch("app.api.v1.agents.upsert_many", new=AsyncMock(return_value=0)),
             patch("app.api.v1.agents.publish_fallback_result", new=AsyncMock()),
         ):
             resp = client.post(
@@ -194,8 +202,10 @@ class TestFallbackSearchResponse:
         """NODE_INTEGRATION_CONTRACT §2 response: query_id, datasets_found, published."""
         with (
             patch("app.agents.fallback_agent.FallbackAgent.discover", new=AsyncMock(return_value=[])),
-            patch("app.agents.verification_agent.VerificationAgent.verify", new=AsyncMock(return_value=[])),
-            patch("app.api.v1.agents.upsert_many", new=AsyncMock(return_value=0)),
+            patch(
+                "app.api.v1.agents.run_quality_pipeline",
+                new=AsyncMock(return_value=PipelineRunResult(datasets=[], errors=[], elapsed_ms=4)),
+            ),
             patch("app.api.v1.agents.publish_fallback_result", new=AsyncMock()),
         ):
             resp = client.post(
@@ -207,15 +217,18 @@ class TestFallbackSearchResponse:
         for field in ("query_id", "datasets_found", "published", "datasets"):
             assert field in body, f"Missing contract field: {field}"
 
-    def test_upsert_not_called_when_no_datasets(
+    def test_pipeline_runs_with_publish_true_even_with_no_candidates(
         self, client: TestClient, auth_headers: dict
     ) -> None:
-        """upsert_many must only be called when there are verified datasets."""
-        mock_upsert = AsyncMock(return_value=0)
+        """Web candidates always run the quality pipeline with publish=True
+        (Stage 7 is the only persistence path — the endpoint never writes
+        directly); an empty candidate list simply yields zero datasets."""
+        mock_pipeline = AsyncMock(
+            return_value=PipelineRunResult(datasets=[], errors=[], elapsed_ms=4)
+        )
         with (
             patch("app.agents.fallback_agent.FallbackAgent.discover", new=AsyncMock(return_value=[])),
-            patch("app.agents.verification_agent.VerificationAgent.verify", new=AsyncMock(return_value=[])),
-            patch("app.api.v1.agents.upsert_many", new=mock_upsert),
+            patch("app.api.v1.agents.run_quality_pipeline", new=mock_pipeline),
             patch("app.api.v1.agents.publish_fallback_result", new=AsyncMock()),
         ):
             client.post(
@@ -223,7 +236,53 @@ class TestFallbackSearchResponse:
                 headers=auth_headers,
                 json=_FALLBACK_PAYLOAD,
             )
-        mock_upsert.assert_not_called()
+        mock_pipeline.assert_awaited_once()
+        assert mock_pipeline.await_args.kwargs.get("publish") is True
+
+    def test_surviving_datasets_returned_and_published(
+        self, client: TestClient, auth_headers: dict
+    ) -> None:
+        """Datasets that survive the pipeline are returned in the response and
+        included in the Redis publish payload."""
+        ds = Dataset(
+            title="Web fMRI dataset",
+            description="d",
+            source="web_search",
+            source_id="abc123",
+            url="https://openneuro.org/datasets/ds000999",
+            modality=["fMRI"],
+        )
+        mock_publish = AsyncMock()
+        with (
+            patch(
+                "app.agents.fallback_agent.FallbackAgent.discover",
+                new=AsyncMock(
+                    return_value=[
+                        FallbackCandidate(
+                            title="Web fMRI dataset",
+                            url="https://openneuro.org/datasets/ds000999",
+                            source_guess="openneuro",
+                            reasoning="r",
+                        )
+                    ]
+                ),
+            ),
+            patch(
+                "app.api.v1.agents.run_quality_pipeline",
+                new=AsyncMock(return_value=PipelineRunResult(datasets=[ds], errors=[], elapsed_ms=5)),
+            ),
+            patch("app.api.v1.agents.publish_fallback_result", new=mock_publish),
+        ):
+            resp = client.post(
+                "/api/v1/agents/fallback-search",
+                headers=auth_headers,
+                json=_FALLBACK_PAYLOAD,
+            )
+        body = resp.json()
+        assert body["datasets_found"] == 1
+        assert body["datasets"][0]["source"] == "web_search"
+        assert mock_publish.await_args[0][0] == "sess_abc123"
+        assert len(mock_publish.await_args[0][1]["datasets"]) == 1
 
     def test_redis_always_published_even_with_empty_results(
         self, client: TestClient, auth_headers: dict
@@ -233,8 +292,10 @@ class TestFallbackSearchResponse:
         mock_publish = AsyncMock()
         with (
             patch("app.agents.fallback_agent.FallbackAgent.discover", new=AsyncMock(return_value=[])),
-            patch("app.agents.verification_agent.VerificationAgent.verify", new=AsyncMock(return_value=[])),
-            patch("app.api.v1.agents.upsert_many", new=AsyncMock(return_value=0)),
+            patch(
+                "app.api.v1.agents.run_quality_pipeline",
+                new=AsyncMock(return_value=PipelineRunResult(datasets=[], errors=[], elapsed_ms=4)),
+            ),
             patch("app.api.v1.agents.publish_fallback_result", new=mock_publish),
         ):
             client.post(
