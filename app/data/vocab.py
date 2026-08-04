@@ -1,12 +1,13 @@
 """
-Controlled vocabularies + SPDX license map — STRUCTURE ONLY (§3.3, §4.8).
+Controlled vocabularies + SPDX license map (§3.3, §4.8).
 
-Per execution instructions the vocabulary **data is intentionally
-unimplemented**: no term is authored or inferred until the approved
-lists are provided. This module pins down the expected shapes and the
-consumption contract so Stage 3 of the quality pipeline and tests can
-depend on it today; every structure below is empty and therefore a
-no-op at runtime (exact-match only — empty vocab means no backfill).
+Populated 2026-08-04 (query-first stabilization, Issue 3): repository
+candidates often declare ``modality = []`` while their title/description
+clearly describe MEG / MRI / EEG / fMRI / PET etc. Stage 3 of the quality
+pipeline reads these vocabularies via exact (word-boundary) token matching
+and fills empty structured fields — reusing the existing enrichment
+architecture (no duplicate normalization system). Empty vocab = no backfill;
+the pipeline degrades gracefully.
 
 Usage contract
 --------------
@@ -19,22 +20,122 @@ Usage contract
 
 Stage 3 reads these via exact (word-boundary) token matching and only
 sets a field when a vocabulary token matches — never LLM, never inferred.
+Modality labels mirror the synonym families already approved in
+``app.connectors.base.MODALITY_SYNONYMS`` (a token maps to the same label a
+synonym family would match).
 """
 
-# UNIMPLEMENTED — pending approved vocabulary specification.
-MODALITY_VOCAB: dict[str, list[str]] = {}
+# Modality label -> accepted raw tokens (lowercase). Mirrors the approved
+# MODALITY_SYNONYMS families in app/connectors/base.py.
+MODALITY_VOCAB: dict[str, list[str]] = {
+    "meg": ["meg", "magnetoencephalography", "magnetoencephalogram"],
+    "eeg": ["eeg", "electroencephalography", "electroencephalogram"],
+    "ieeg": ["ieeg", "intracranial eeg", "intracranial electroencephalography"],
+    "ecog": ["ecog", "electrocorticography"],
+    "mri": ["mri", "magnetic resonance imaging"],
+    "fmri": ["fmri", "functional mri", "functional magnetic resonance imaging"],
+    "smri": ["smri", "structural mri", "structural magnetic resonance imaging", "t1-weighted", "t2-weighted"],
+    "pet": ["pet", "positron emission tomography"],
+    "dti": ["dti", "diffusion tensor imaging", "diffusion-weighted imaging", "diffusion mri"],
+    "nirs": ["nirs", "near-infrared spectroscopy"],
+    "fnirs": ["fnirs", "functional near-infrared spectroscopy"],
+}
 
-# UNIMPLEMENTED — pending approved vocabulary specification.
-SPECIES_VOCAB: dict[str, list[str]] = {}
+# Species label -> accepted raw tokens (lowercase).
+SPECIES_VOCAB: dict[str, list[str]] = {
+    "human": [
+        "human", "humans", "participant", "participants", "volunteer", "volunteers",
+        "subject", "subjects", "patients", "healthy controls", "adult volunteers",
+    ],
+    "mouse": ["mouse", "mice", "murine"],
+    "rat": ["rat", "rats"],
+    "macaque": ["macaque", "macaques", "rhesus", "monkey", "monkeys", "primate", "primates"],
+    "zebrafish": ["zebrafish", "danio rerio"],
+    "drosophila": ["drosophila", "fruit fly", "fruit flies"],
+    "c.elegans": ["c. elegans", "caenorhabditis elegans"],
+}
 
-# UNIMPLEMENTED — pending approved vocabulary specification.
-REGION_TERMS: list[str] = []
+# Flat region tokens (lowercase) — first exact match wins. More specific
+# terms are listed first so e.g. "prefrontal cortex" wins over "cortex".
+REGION_TERMS: list[str] = [
+    "dorsolateral prefrontal cortex",
+    "ventromedial prefrontal cortex",
+    "prefrontal cortex",
+    "somatosensory cortex",
+    "motor cortex",
+    "visual cortex",
+    "auditory cortex",
+    "cingulate cortex",
+    "entorhinal cortex",
+    "parahippocampal gyrus",
+    "parahippocampal cortex",
+    "insula",
+    "insular cortex",
+    "frontal cortex",
+    "temporal cortex",
+    "parietal cortex",
+    "occipital cortex",
+    "cerebral cortex",
+    "basal ganglia",
+    "nucleus accumbens",
+    "substantia nigra",
+    "ventral tegmental area",
+    "corpus callosum",
+    "white matter",
+    "gray matter",
+    "grey matter",
+    "default mode network",
+    "hippocampus",
+    "hippocampal",
+    "amygdala",
+    "thalamus",
+    "hypothalamus",
+    "striatum",
+    "cerebellum",
+    "cerebellar",
+    "brainstem",
+    "whole brain",
+    "whole-brain",
+]
 
-# UNIMPLEMENTED — pending approved vocabulary specification.
-AGE_TERMS: dict[str, list[str]] = {}
+# Age label -> accepted raw tokens (lowercase).
+AGE_TERMS: dict[str, list[str]] = {
+    "infant": ["infant", "infants", "newborn", "newborns", "neonatal", "neonates"],
+    "child": ["child", "children", "pediatric", "pediatrics", "school-age"],
+    "adolescent": ["adolescent", "adolescents", "teenager", "teenagers", "youth"],
+    "adult": ["adult", "adults"],
+    "elderly": ["elderly", "older adult", "older adults", "older-adult", "geriatric", "aged"],
+}
 
-# UNIMPLEMENTED — pending approved vocabulary specification.
-DISEASE_TERMS: dict[str, list[str]] = {}
+# Disease label -> accepted raw tokens (lowercase). Short, ambiguous
+# abbreviations (pd, ad, ms, als, mci, tbi) are intentionally NOT included:
+# exact word-boundary matching would risk false positives.
+DISEASE_TERMS: dict[str, list[str]] = {
+    "parkinson": ["parkinson", "parkinson's", "parkinsons", "parkinson disease", "parkinson's disease"],
+    "alzheimer": ["alzheimer", "alzheimer's", "alzheimers", "alzheimer disease", "alzheimer's disease"],
+    "mild cognitive impairment": ["mild cognitive impairment", "cognitive impairment"],
+    "dementia": ["dementia", "demented", "lewy body"],
+    "adhd": ["adhd", "attention deficit hyperactivity disorder", "attention deficit disorder"],
+    "schizophrenia": ["schizophrenia", "schizophrenic", "psychosis", "psychotic"],
+    "bipolar": ["bipolar", "bipolar disorder", "manic depression"],
+    "depression": ["depression", "depressive", "major depressive disorder", "mdd"],
+    "anxiety": ["anxiety", "anxious", "generalized anxiety"],
+    "autism": ["autism", "autistic", "asd", "autism spectrum disorder"],
+    "epilepsy": ["epilepsy", "epileptic", "epileptiform", "seizure", "seizures"],
+    "multiple sclerosis": ["multiple sclerosis"],
+    "amyotrophic lateral sclerosis": ["amyotrophic lateral sclerosis"],
+    "huntington": ["huntington", "huntington's", "huntingtons", "huntington disease"],
+    "stroke": ["stroke", "strokes", "ischemic stroke", "cerebrovascular accident"],
+    "traumatic brain injury": ["traumatic brain injury", "head injury", "concussion"],
+    "migraine": ["migraine", "migraines"],
+    "insomnia": ["insomnia", "sleep disorder", "sleep disorders"],
+    "obesity": ["obesity", "obese"],
+    "diabetes": ["diabetes", "diabetic", "type 2 diabetes", "type 1 diabetes"],
+    "covid": ["covid", "covid-19", "sars-cov-2", "coronavirus"],
+    "tinnitus": ["tinnitus"],
+    "chronic pain": ["chronic pain", "neuropathic pain", "fibromyalgia"],
+}
 
-# UNIMPLEMENTED — pending approved SPDX license map.
+# Unimplemented — pending approved SPDX license map. Connector-declared
+# license strings are preserved unchanged.
 LICENSE_SPDX_MAP: dict[str, str] = {}

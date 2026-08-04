@@ -15,7 +15,11 @@ import time
 from dataclasses import dataclass, field
 
 from app.config import get_settings
-from app.connectors.base import SearchRequest, SearchResult
+from app.connectors.base import (
+    SearchRequest,
+    SearchResult,
+    _has_modality_or_neuroscience_evidence,
+)
 from app.connectors.registry import get_connector, get_enabled_sources
 from app.models.query_filters import QueryFilters
 from app.models.repository_dataset import RepositoryDataset
@@ -87,6 +91,21 @@ async def aggregate_repository_search(
         aggregate.total_available += result.total_available
         if result.error:
             aggregate.errors.append(f"{source}: {result.error}")
+
+    # Issue 4 (query-first stabilization) — uniform evidence gate. Only the
+    # connectors with coarse server search call ``post_filter`` client-side
+    # (openneuro/dandi/neurovault/nitrc); generic repositories
+    # (zenodo/figshare/dryad/osf/ebrains) do not. When a specific modality is
+    # explicitly requested, a candidate declaring no modality AND carrying no
+    # neuroscience evidence is unrelated to the request — filter it here so the
+    # gate applies uniformly. Idempotent for sources that already filtered.
+    # No other post-filter semantics are applied (modality/species overlap
+    # stays connector-level, unchanged).
+    if filters.modality:
+        aggregate.records = [
+            r for r in aggregate.records
+            if r.modality or _has_modality_or_neuroscience_evidence(r)
+        ]
 
     aggregate.elapsed_ms = int((time.monotonic() - start) * 1000)
     logger.info(

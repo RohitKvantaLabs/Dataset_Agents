@@ -183,20 +183,71 @@ def _modality_overlap(requested: str, declared: str) -> bool:
     return r in d or d in r
 
 
+# Neuroscience-evidence tokens used by the Issue-4 evidence gate. When a
+# specific modality is explicitly requested and a candidate declares NO
+# modality, the candidate is kept only if it carries some neuroscience
+# evidence in its title/description/keywords (Stage 3 can still enrich it).
+# Records with neither modality nor neuroscience evidence are unrelated to
+# the request and filtered. Substring matching is deliberately generous
+# (false positives only ever KEEP a record — never drop one), so repository
+# coverage is not reduced for anything with a neuroscience signal.
+NEUROSCIENCE_EVIDENCE_TERMS: frozenset[str] = frozenset(
+    {
+        "meg", "magnetoencephalography", "magnetoencephalogram",
+        "eeg", "electroencephalography", "electroencephalogram",
+        "ieeg", "ecog", "electrocorticography", "electrophysiology",
+        "electrophysiological", "spikes", "spiking", "spike",
+        "mri", "fmri", "smri", "magnetic resonance", "neuroimaging",
+        "pet", "positron emission tomography", "dti", "nirs", "fnirs",
+        "diffusion tensor", "connectome", "functional connectivity",
+        "brain", "cerebral", "cerebellar", "cerebellum", "cortex",
+        "cortical", "hippocampus", "hippocampal", "amygdala", "thalamus",
+        "striatum", "neural", "neuronal", "neuron", "neurons",
+        "neuroscience", "neurological", "neurodegenerative",
+        "neuropsychiatric", "neurodevelopmental", "neuromodulation",
+        "parkinson", "alzheimer", "dementia", "epilepsy", "seizure",
+        "schizophrenia", "stroke", "resting-state", "task-fmri",
+    }
+)
+
+
+def _has_modality_or_neuroscience_evidence(dataset: RepositoryDataset) -> bool:
+    """True when a candidate declares any modality OR carries neuroscience-
+    evidence terms in its title/description/keywords (Issue 4)."""
+    if dataset.modality:
+        return True
+    text = " ".join(
+        [dataset.title or "", dataset.description or "", " ".join(dataset.keywords or [])]
+    ).lower()
+    return any(tok in text for tok in NEUROSCIENCE_EVIDENCE_TERMS)
+
+
 def post_filter(dataset: RepositoryDataset, filters: QueryFilters) -> bool:
     """
     Client-side post-filter for connectors whose server search is coarse
     (§2.4 OpenNeuro / §2.5 DANDI / §2.12 NITRC — modality & species).
 
     A candidate is kept when:
-    - it has no declared value for a requested dimension (Stage 3 fills it), or
+    - it has no declared value for a requested dimension AND no contrary
+      evidence, or
     - at least one declared value overlaps the requested values (modality
       synonym families included — see MODALITY_SYNONYMS).
+
+    Issue 4 (query-first stabilization): when a specific modality is
+    explicitly requested and the candidate declares NO modality at all, the
+    candidate is kept only if it carries neuroscience evidence (Stage 3
+    enrichment can still fill the modality). Candidates with neither modality
+    nor neuroscience evidence are unrelated to the request and are filtered —
+    this removes loosely-related generic-repository records without reducing
+    coverage for anything with a neuroscience signal.
     """
-    if filters.modality and dataset.modality:
+    if filters.modality:
         requested = {m.lower() for m in filters.modality}
-        declared = {m.lower() for m in dataset.modality}
-        if not any(_modality_overlap(r, d) for r in requested for d in declared):
+        if dataset.modality:
+            declared = {m.lower() for m in dataset.modality}
+            if not any(_modality_overlap(r, d) for r in requested for d in declared):
+                return False
+        elif not _has_modality_or_neuroscience_evidence(dataset):
             return False
     if filters.species and dataset.species:
         requested = {s.lower() for s in filters.species}
