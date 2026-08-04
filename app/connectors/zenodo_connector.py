@@ -36,7 +36,10 @@ _zenodo_circuit_breaker = CircuitBreaker(
 logger = logging.getLogger("neuro_platform.connectors.zenodo")
 
 ZENODO_API_BASE = "https://zenodo.org/api/records"
-PAGE_SIZE = 100  # Zenodo max page size
+# Stabilization (Phase 1, confirmed live 2026-08-04): Zenodo caps ANONYMOUS
+# page size at 25 ("Page size cannot be greater than 25 …"). 100 is only
+# allowed with an authenticated token. Using 100 made every request 400.
+PAGE_SIZE = 25
 
 # Characters with special meaning in Zenodo's Lucene query syntax.
 _LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}[\]^"~*?:\\/])')
@@ -56,16 +59,13 @@ class ZenodoConnector(BaseConnector):
         self._client = http_client or httpx.AsyncClient(
             timeout=settings.REQUEST_TIMEOUT_SECONDS,
             headers={"Accept": "application/json"},
+            follow_redirects=True,  # §2.8 — Zenodo 301-redirects /records/ → /records
         )
         self._limiter = TokenBucket(rate=get_rate_limit("zenodo"), burst=5)
 
     @property
     def source_name(self) -> str:
         return "zenodo"
-
-    async def fetch(self, limit: int = 200) -> list[dict[str, Any]]:
-        # §2.8 marks zenodo as S (search-only) — batch sync not required.
-        raise NotImplementedError("zenodo is a search-only connector (S) in v0.2")
 
     @connector_retry
     async def _get_json(self, url: str) -> dict:
@@ -90,10 +90,19 @@ class ZenodoConnector(BaseConnector):
                 while len(records) < req.limit and page <= max_pages:
                     await self._limiter.acquire()
 
-                    url = (
-                        f"{ZENODO_API_BASE}/?q={quote(query_terms)}"
-                        f"&type=dataset&size={size}&page={page}"
-                    )
+                    # Stabilization (Phase 1, confirmed live 2026-08-04):
+                    # ``?q=`` with an EMPTY value returns HTTP 400. Omit the
+                    # q parameter entirely when no query terms exist (batch
+                    # sync fetch mode) — type=dataset then returns the catalog.
+                    if query_terms:
+                        url = (
+                            f"{ZENODO_API_BASE}?q={quote(query_terms)}"
+                            f"&type=dataset&size={size}&page={page}"
+                        )
+                    else:
+                        url = (
+                            f"{ZENODO_API_BASE}?type=dataset&size={size}&page={page}"
+                        )
                     data = await self._get_json(url)
 
                     hits = data.get("hits", {})

@@ -4,8 +4,17 @@ OpenNeuro GraphQL Connector.
 Two capabilities:
 - ``fetch()`` — batch sync of dataset metadata (existing path, §2.4/B).
 - ``search()`` — online structured retrieval via the public GraphQL API
-  with a keyword clause on dataset name/description (§2.4/S), then
+  (§2.4/S) with server-side keyword search through ``advancedSearch`` and
   client-side post-filtering of modality/species.
+
+Schema drift (stabilization, 2026-08-04): the live OpenNeuro GraphQL schema
+(extensions.openneuro.version 5.4.0) does NOT support a ``query`` argument on
+``Query.datasets``, and the ``Dataset`` type has no top-level ``description``
+field. Server-side free-text search is provided by ``Query.advancedSearch``
+with a ``DatasetSearchInput { keywords: [String!]! }``; dataset metadata lives
+under ``metadata { modalities species … }`` and ``latestSnapshot.description
+{ Name Authors License DatasetDOI }``. Queries below were validated against
+the live schema via introspection before shipping.
 
 OpenNeuro API playground: https://openneuro.org/crn/graphql (POST)
 """
@@ -40,29 +49,31 @@ logger = logging.getLogger("neuro_platform.connectors.openneuro")
 
 OPENNEURO_GRAPHQL_URL = "https://openneuro.org/crn/graphql"
 
-# GraphQL query — fetches datasets with pagination (cursor-based).
-# We request only the fields needed for the Common Schema to keep
-# payloads small on the free public endpoint.
-DATASETS_QUERY = """
+# Current-schema pagination query (no `query` arg — plain pagination + cursor).
+# Node fields match the live 5.4.0 schema: metadata.modalities (lowercase, e.g.
+# "mri"), metadata.species, and latestSnapshot.description.{Name,Authors,
+# License,DatasetDOI}.
+DATASETS_QUERY = """\
 query FetchDatasets($first: Int!, $after: String) {
   datasets(first: $first, after: $after) {
     edges {
       node {
         id
-        name: name
+        name
         created
-        description {
-          Name
-          Authors
-          License
-          DatasetDOI
-        }
+        publishDate
         metadata {
+          datasetName
           modalities
-          subjectCount
           species
-          trialCount
-          dataProcessed
+        }
+        latestSnapshot {
+          description {
+            Name
+            Authors
+            License
+            DatasetDOI
+          }
         }
       }
     }
@@ -74,28 +85,28 @@ query FetchDatasets($first: Int!, $after: String) {
 }
 """
 
-# Search variant — same shape plus an optional `query` clause applied
-# server-side against dataset name/description (§2.4 search strategy).
-SEARCH_DATASETS_QUERY = """
-query SearchDatasets($first: Int!, $after: String, $query: String) {
-  datasets(first: $first, after: $after, query: $query) {
+# Server-side keyword search (confirmed working against live schema).
+ADVANCED_SEARCH_QUERY = """\
+query AdvancedSearchDatasets($first: Int!, $after: String, $input: DatasetSearchInput!) {
+  advancedSearch(first: $first, after: $after, query: $input) {
     edges {
       node {
         id
-        name: name
+        name
         created
-        description {
-          Name
-          Authors
-          License
-          DatasetDOI
-        }
+        publishDate
         metadata {
+          datasetName
           modalities
-          subjectCount
           species
-          trialCount
-          dataProcessed
+        }
+        latestSnapshot {
+          description {
+            Name
+            Authors
+            License
+            DatasetDOI
+          }
         }
       }
     }
@@ -213,10 +224,14 @@ class OpenNeuroConnector(BaseConnector):
         """
         OpenNeuro online search (§2.4).
 
-        Uses the search query (server-side keyword clause on name/description)
-        when query terms exist, otherwise falls back to plain pagination.
-        Modality/species are post-filtered client-side. Never raises — a
-        failure yields an empty SearchResult with status="offline".
+        Strategy (validated against the live 5.4.0 schema):
+          1. ``advancedSearch(query: { keywords: [terms] })`` — server-side
+             free-text search; returns relevant datasets first.
+          2. Fallback to plain ``datasets(first, after)`` pagination when the
+             advancedSearch call fails (validation error, outage) — modality
+             and species are still post-filtered client-side.
+        Never raises — a failure yields an empty SearchResult with
+        status="offline".
         """
         start = time.monotonic()
         records = []
@@ -232,6 +247,7 @@ class OpenNeuroConnector(BaseConnector):
                 pages = 0
                 max_pages = get_max_pages()
                 page_info = {}  # set inside the loop; default keeps `truncated` safe on early break
+                used_advanced = False
 
                 while len(records) < req.limit and pages < max_pages:
                     pages += 1
@@ -241,17 +257,40 @@ class OpenNeuroConnector(BaseConnector):
                     if cursor:
                         variables["after"] = cursor
 
-                    if query_terms:
-                        body = await self._post_graphql(SEARCH_DATASETS_QUERY, {**variables, "query": query_terms})
+                    if query_terms and not used_advanced:
+                        # Server-side keyword search via DatasetSearchInput.
+                        body = await self._post_graphql(
+                            ADVANCED_SEARCH_QUERY,
+                            {**variables, "input": {"keywords": [query_terms]}},
+                        )
                         if "errors" in body:
-                            # Schema drift: API rejected the `query` arg → fall
-                            # back to unfiltered pagination + client-side filter
-                            # (§2.4), keeping the connector functional.
+                            # advancedSearch rejected → fall back to plain
+                            # pagination + client-side post-filter (§2.4).
                             logger.warning(
-                                "OpenNeuro rejected `query` arg — falling back to unfiltered pagination: %s",
+                                "OpenNeuro advancedSearch rejected — falling back to "
+                                "plain pagination: %s",
                                 body["errors"],
                             )
+                            used_advanced = True
                             body = await self._post_graphql(DATASETS_QUERY, variables)
+                        else:
+                            used_advanced = True
+                            # The API may return data alongside partial errors
+                            # (private datasets); use what we got.
+                            adv = (body.get("data") or {}).get("advancedSearch") or {}
+                            edges = adv.get("edges", [])
+                            page_info = adv.get("pageInfo", {})
+                            for edge in edges:
+                                node = edge.get("node", {})
+                                ds = normalize_repository(node, self.source_name)
+                                if ds is not None and post_filter(ds, req.filters):
+                                    records.append(ds)
+                                    if len(records) >= req.limit:
+                                        break
+                            if not page_info.get("hasNextPage") or not edges:
+                                break
+                            cursor = page_info.get("endCursor")
+                            continue
                     else:
                         body = await self._post_graphql(DATASETS_QUERY, variables)
 

@@ -110,8 +110,19 @@ class VerificationAgent:
     def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
         settings = get_settings()
         self._owns_client = http_client is None
+        # Stabilization (Phase 1, confirmed live 2026-08-04): figshare (and
+        # several other repositories) 403 the default ``python-httpx`` UA on
+        # both the API and article pages. Use a browser-shaped UA so Stage 4
+        # link checks see real liveness instead of a UA-based 403.
         self._client = http_client or httpx.AsyncClient(
-            timeout=settings.HTTP_CHECK_TIMEOUT_SECONDS, follow_redirects=True
+            timeout=settings.HTTP_CHECK_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (NeuroDataPlatform/1.0 link verifier; "
+                    "contact: neuro-data-platform) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+                )
+            },
         )
 
     async def verify(self, candidates: list[FallbackCandidate], filters: QueryFilters | None = None) -> list[Dataset]:
@@ -229,7 +240,14 @@ class VerificationAgent:
         return TrustTier.VERIFIED if is_live else TrustTier.STALE
 
     async def _check_link(self, url: str) -> tuple[bool, str, httpx.Response | None]:
-        """Return (is_live, domain, response). Handles malformed URLs gracefully."""
+        """Return (is_live, domain, response). Handles malformed URLs gracefully.
+
+        Stabilization (Phase 1, confirmed live 2026-08-04): repositories have
+        OPPOSITE UA policies — figshare 403s the library default ``python-httpx``
+        UA and accepts a browser-shaped UA, while Zenodo 403s the browser-shaped
+        UA and accepts the default. So a 403 is retried once with the fallback
+        UA before the link is judged dead.
+        """
         try:
             parsed = httpx.URL(url)
         except Exception:
@@ -237,11 +255,16 @@ class VerificationAgent:
             return False, "", None
 
         domain = parsed.host or ""
+        default_ua = {"User-Agent": f"python-httpx/{httpx.__version__}"}
         try:
             resp = await self._client.head(url)
+            if resp.status_code == 403:
+                resp = await self._client.head(url, headers=default_ua)
             if resp.status_code >= 400:
                 # Some servers reject HEAD — retry with a lightweight GET before giving up.
                 resp = await self._client.get(url)
+                if resp.status_code == 403:
+                    resp = await self._client.get(url, headers=default_ua)
             return resp.status_code < 400, domain, resp
         except httpx.HTTPError as exc:
             logger.info("Link check failed for %s: %s", url, exc)

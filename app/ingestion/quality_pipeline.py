@@ -93,15 +93,78 @@ REPOSITORY_SOURCE_KEYS: frozenset[str] = frozenset(SOURCE_HOSTS)
 
 # §3.2 Stage 2 classifier constants (documented lists — not vocabularies).
 SOFTWARE_TERMS: frozenset[str] = frozenset(
-    {"tool", "application", "source code", "software", "workflow"}
+    {"tool", "application", "source code", "software", "workflow", "toolbox", "library", "pipeline", "app"}
 )
+
+# Stabilization (Phase 3): the classifier must distinguish Dataset / Dataset
+# Collection / Paper / Software / Documentation / Blog / Forum / Unknown, and
+# only Dataset + Dataset Collection may proceed to persistence. Papers, docs,
+# software, blogs, forums, GitHub repos, StackExchange, Neurostars, PubMed,
+# Semantic Scholar, and Connected Papers can NEVER be classified as datasets.
+
+# Domains whose content type is unambiguous (web-origin candidates and, where
+# the repo-native type is missing, repository-origin candidates).
+PAPER_DOMAINS: frozenset[str] = frozenset(
+    {
+        "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov",
+        "arxiv.org", "biorxiv.org", "medrxiv.org", "psyarxiv.com",
+        "semanticscholar.org", "connectedpapers.com", "sciencedirect.com",
+        "nature.com", "springer.com", "wiley.com", "frontiersin.org",
+        "plos.org", "academic.oup.com", "jneurosci.org", "cell.com",
+        "ieee.org", "elsevier.com", "thelancet.com", "nejm.org",
+        "researchgate.net", "academia.edu", "mdpi.com", "sagepub.com",
+        "tandfonline.com", "jamanetwork.com", "bmj.com", "science.org",
+        "pnas.org", "elifesciences.org", "peerj.com", "f1000research.com",
+    }
+)
+PAPER_TITLE_TERMS: tuple[str, ...] = (
+    " paper", "paper ", "-paper", "article", "journal", "publication",
+    "preprint", "study", "analysis of", "meta-analysis", "systematic review",
+    "manuscript", "abstract", "proceedings", "chapter",
+)
+
+BLOG_DOMAINS: frozenset[str] = frozenset(
+    {"medium.com", "wordpress.com", "blogger.com", "substack.com", "tumblr.com",
+     "hashnode.com", "dev.to", "ghost.io", "wixsite.com", "squarespace.com"}
+)
+
+FORUM_DOMAINS: frozenset[str] = frozenset(
+    {"stackexchange.com", "stackoverflow.com", "neurostars.org", "discourse.org",
+     "reddit.com", "quora.com", "github.com", "gitlab.com"}
+)
+FORUM_TITLE_TERMS: tuple[str, ...] = (
+    " forum", "forum ", "-forum", "discussion", "thread", "question",
+    "answers", "issue ", "issues ", "board", "conversation", "community ",
+)
+
+DOCUMENTATION_DOMAINS: frozenset[str] = frozenset(
+    {"readthedocs.io", "gitbook.io", "gitbook.com", "wikipedia.org",
+     "wiktionary.org", "docs.github.com", "developer.mozilla.org",
+     "learn.microsoft.com", "kaggle.com/docs", "dandiarchive.org/documentation"}
+)
+
+SOFTWARE_DOMAINS: frozenset[str] = frozenset(
+    {"github.com", "gitlab.com", "bitbucket.org", "sourceforge.net", "pypi.org",
+     "npmjs.com", "crates.io", "docker.com", "hub.docker.com", "anaconda.org"}
+)
+
+# Dataset landing/collection URL markers on supported repository domains.
+# Stabilization (Phase 1, confirmed live 2026-08-04): OpenNeuro uses the
+# plural "/datasets/" path (``/datasets/ds000001``), so both singular and
+# plural forms are required — without "/datasets/", every OpenNeuro record
+# fell through to "unknown" and was dropped at Stage 4.
 DATASET_PATH_MARKERS: tuple[str, ...] = (
     "/dataset/",
+    "/datasets/",
     "/dandiset/",
     "/records/",
     "/collections/",
     "/projects/",
 )
+
+# Markers that indicate a *collection of datasets* rather than a single one.
+# (NeuroVault collections, NITRC projects, OSF category=data registrations.)
+COLLECTION_PATH_MARKERS: tuple[str, ...] = ("/collections/", "/projects/")
 
 
 # ────────────────────────── result / internal state ──────────────────────────
@@ -155,8 +218,12 @@ class _Record:
 
 
 def _host_of(url: str) -> str:
+    """Lowercased hostname with the ``www.`` prefix normalized away, so
+    ``www.nitrc.org`` and ``nitrc.org`` are treated as the same host by the
+    Stage-1 allowlist, Stage-2 known-domain check, and Stage-4 trust check."""
     try:
-        return (urlparse(url).hostname or "").lower()
+        host = (urlparse(url).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
     except Exception:  # noqa: BLE001 — malformed URL must not abort
         return ""
 
@@ -237,8 +304,16 @@ def _stage_filter(records: list[_Record], settings) -> tuple[list[_Record], Stag
             continue
         # 2) URL host allowlist: repository-origin only (web candidates are not
         #    rejected for originating outside the repository allowlist)
+        #
+        # Stabilization (Phase 1, confirmed live 2026-08-04): figshare hosts
+        # datasets on branded portal subdomains (karger.figshare.com,
+        # frontiersin.figshare.com, …) — the exact-host check dropped them.
+        # Accept any subdomain of an allowlisted canonical host.
         host = _host_of(c.url)
-        if not is_web and (not host or host not in allowlist):
+        host_ok = host in allowlist or any(
+            host.endswith("." + h) for h in allowlist if h and "." in h
+        )
+        if not is_web and (not host or not host_ok):
             stats.drop("domain_not_allowlisted")
             continue
         # 3) URL host ∈ REPOSITORY_BLOCKLIST — applies to all origins
@@ -258,10 +333,14 @@ def _stage_filter(records: list[_Record], settings) -> tuple[list[_Record], Stag
 # ───────────────────────────── Stage 2 — Classify ─────────────────────────────
 
 
-def _repo_declares_dataset(raw: dict) -> bool:
-    """§3.2 rule 3 — repo-native resource/defined/type says 'dataset'."""
+def _repo_native_class(raw: dict) -> str | None:
+    """§3.2 rule 3 — repo-native resource/defined/type declares the record class.
+
+    Returns ``"dataset"``, ``"dataset_collection"``, ``"paper"``,
+    ``"software"``, or ``None`` when the payload does not declare a type.
+    """
     if not isinstance(raw, dict):
-        return False
+        return None
     needles: list[str] = []
     meta = raw.get("metadata")
     if isinstance(meta, dict):
@@ -272,11 +351,33 @@ def _repo_declares_dataset(raw: dict) -> bool:
                     needles.append(rt[k].lower())
         elif isinstance(rt, str):
             needles.append(rt.lower())
-    for key in ("defined_type", "type", "resource_type", "kind"):
+    for key in ("defined_type", "defined_type_name", "type", "resource_type", "kind"):
         v = raw.get(key)
         if isinstance(v, str):
             needles.append(v.lower())
-    return any("dataset" in n for n in needles if n)
+    # OSF nodes/registrations declare category in attributes (e.g. "data").
+    attrs = raw.get("attributes")
+    if isinstance(attrs, dict) and isinstance(attrs.get("category"), str):
+        needles.append(f"category:{attrs['category'].lower()}")
+    for key in ("category",):
+        v = raw.get(key)
+        if isinstance(v, str):
+            needles.append(f"category:{v.lower()}")
+
+    for n in needles:
+        if not n:
+            continue
+        if "dataset collection" in n or "data collection" in n or "collection" in n and "dataset" in n:
+            return "dataset_collection"
+        if "category:data" in n:
+            return "dataset_collection"
+        if "dataset" in n:
+            return "dataset"
+        if any(p in n for p in ("paper", "article", "preprint", "publication", "thesis", "journal")):
+            return "paper"
+        if any(s in n for s in ("software", "code", "tool", "workflow", "app", "library")):
+            return "software"
+    return None
 
 
 def _files_declare_dataset(files: list) -> bool:
@@ -297,44 +398,77 @@ def _known_domain_host(host: str) -> bool:
     return host in KNOWN_REPOSITORY_DOMAINS or host in set(SOURCE_HOSTS.values())
 
 
+def _classify_content_type(rec: _Record, settings) -> str:
+    """§3.2 — classify a single record into the 8-class taxonomy.
+
+    Returns a class label: dataset | dataset_collection | software | unknown.
+    (paper | blog | forum | documentation are DROPPED by the caller — only
+    Dataset and Dataset Collection may proceed to persistence.)
+    """
+    c = rec.candidate
+    title_l = (c.title or "").lower()
+    host = _host_of(c.url)
+    path = (urlparse(c.url).path or "").lower()
+    url_l = (c.url or "").lower()
+
+    # 1) documentation / specs are never datasets
+    if _is_non_dataset(c.title, c.url):
+        return "documentation"
+
+    # 2) unambiguous content-type domains (paper / blog / forum / docs / software)
+    if host in PAPER_DOMAINS:
+        return "paper"
+    if host in BLOG_DOMAINS or ("/blog" in path or "blog." in host or host == "blog"):
+        return "blog"
+    if host in FORUM_DOMAINS or any(t in title_l for t in FORUM_TITLE_TERMS):
+        # GitHub/GitLab hosts are excluded only when they host a software repo;
+        # a direct dataset file link on those hosts is handled by Stage 4.
+        return "forum" if host not in SOFTWARE_DOMAINS else "software"
+    if host in DOCUMENTATION_DOMAINS:
+        return "documentation"
+    if host in SOFTWARE_DOMAINS or any(term in title_l for term in SOFTWARE_TERMS):
+        return "software"
+
+    # 3) repo-native type declaration (Dataset / Dataset Collection / Paper / Software)
+    native = _repo_native_class(c.raw)
+    if native is not None:
+        return native
+
+    # 4) file signals → dataset
+    if c.files and _files_declare_dataset(c.files):
+        return "dataset"
+
+    # 5) dataset path markers on a known domain → dataset / dataset_collection
+    if _known_domain_host(host) and any(m in path for m in DATASET_PATH_MARKERS):
+        return "dataset_collection" if any(m in path for m in COLLECTION_PATH_MARKERS) else "dataset"
+
+    # 6) otherwise unknown → Stage 4 decides (direct link reclassifies)
+    return "unknown"
+
+
 def _stage_classify(records: list[_Record], settings) -> tuple[list[_Record], StageStats]:
-    """§3.2 — deterministic classifier (no LLM). 'unknown' survives to Stage 4."""
+    """§3.2 — deterministic classifier (no LLM).
+
+    Only ``dataset`` and ``dataset_collection`` may proceed to persistence;
+    ``paper``, ``blog``, ``forum``, ``documentation``, and ``software`` are
+    dropped here. ``unknown`` survives to Stage 4 for direct-link reclassification.
+    """
     stats = StageStats()
     kept: list[_Record] = []
+    dropped_labels = {"paper", "blog", "forum", "documentation", "software"}
 
     for rec in records:
-        c = rec.candidate
-        # 1) docs/specs are never datasets
-        if _is_non_dataset(c.title, c.url):
-            stats.drop("documentation")
+        label = _classify_content_type(rec, settings)
+        if label in dropped_labels:
+            stats.drop(label)
             continue
-        # 2) file signals → dataset
-        if c.files and _files_declare_dataset(c.files):
-            rec.class_label = "dataset"
+        # software is allowed through when ALLOW_SOFTWARE is set (label kept
+        # for observability; it never proceeds to persistence unchanged).
+        if label == "software" and settings.ALLOW_SOFTWARE:
+            rec.class_label = "software"
             kept.append(rec)
             continue
-        # 3) repo-native type declaration → dataset
-        if _repo_declares_dataset(c.raw):
-            rec.class_label = "dataset"
-            kept.append(rec)
-            continue
-        # 4) software terms → drop unless ALLOW_SOFTWARE
-        if any(term in c.title.lower() for term in SOFTWARE_TERMS):
-            if settings.ALLOW_SOFTWARE:
-                rec.class_label = "software"
-                kept.append(rec)
-            else:
-                stats.drop("software")
-            continue
-        # 5) dataset path markers on a known domain → dataset
-        host = _host_of(c.url)
-        path = (urlparse(c.url).path or "").lower()
-        if _known_domain_host(host) and any(m in path for m in DATASET_PATH_MARKERS):
-            rec.class_label = "dataset"
-            kept.append(rec)
-            continue
-        # 6) otherwise unknown → Stage 4 decides (direct link reclassifies)
-        rec.class_label = "unknown"
+        rec.class_label = label
         kept.append(rec)
 
     stats.accepted = len(kept)

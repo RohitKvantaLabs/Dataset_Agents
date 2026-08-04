@@ -61,10 +61,6 @@ class EBRAINSConnector(BaseConnector):
     def source_name(self) -> str:
         return "ebrains"
 
-    async def fetch(self, limit: int = 200) -> list[dict[str, Any]]:
-        # §2.7 marks ebrains as S (search-only) — batch sync not required.
-        raise NotImplementedError("ebrains is a search-only connector (S) in v0.2")
-
     @connector_retry
     async def _get_json(self, url: str) -> dict:
         resp = await self._client.get(url)

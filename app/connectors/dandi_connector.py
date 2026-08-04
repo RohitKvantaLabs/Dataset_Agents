@@ -127,39 +127,59 @@ class DandiConnector(BaseConnector):
 
         try:
             async with _dandi_circuit_breaker:
-                query_terms = self.build_query_terms(req)
-                params: dict = {"page_size": min(PAGE_SIZE, req.limit)}
-                if query_terms:
-                    params["search"] = query_terms
+                # DANDI's `?search=` is a full-text AND search: a multi-term
+                # query ("fMRI resting-state hippocampus") returns 0 even when
+                # each individual term matches (confirmed live 2026-08-04).
+                # Progressive fallback: full terms → modality → region → no
+                # search (plain pagination + client-side post_filter).
+                terms = self.build_query_terms(req)
+                search_candidates = [terms] if terms else []
+                if req.filters.modality:
+                    search_candidates.append(" ".join(m for m in req.filters.modality if m))
+                if req.filters.region:
+                    search_candidates.append(req.filters.region)
+                search_candidates.append("")  # final fallback: unfiltered
 
+                params: dict = {"page_size": min(PAGE_SIZE, req.limit)}
                 url = f"{DANDI_API_BASE}/dandisets/"
                 pages = 0
                 max_pages = get_max_pages()
-                first_page = True
 
-                while url and len(records) < req.limit and pages < max_pages:
-                    pages += 1
-                    await self._limiter.acquire()
+                for candidate in search_candidates:
+                    if len(records) >= req.limit:
+                        break
+                    params["search"] = candidate if candidate else None
+                    page_url = url
+                    first_page = True
 
-                    # First page carries the search/page_size params; the API's
-                    # `next` URL is self-sufficient afterwards.
-                    if first_page:
-                        data = await self._get_json(url, params=params)
-                        first_page = False
-                    else:
-                        data = await self._get_json(url)
+                    while page_url and len(records) < req.limit and pages < max_pages:
+                        pages += 1
+                        await self._limiter.acquire()
 
-                    results = data.get("results", [])
-                    total_available = data.get("count") or len(results)
+                        if first_page:
+                            data = await self._get_json(
+                                page_url,
+                                {k: v for k, v in params.items() if v is not None},
+                            )
+                            first_page = False
+                        else:
+                            data = await self._get_json(page_url)
 
-                    for item in results:
-                        ds = normalize_repository(item, self.source_name)
-                        if ds is not None and post_filter(ds, req.filters):
-                            records.append(ds)
-                            if len(records) >= req.limit:
-                                break
+                        results = data.get("results", [])
+                        total_available = data.get("count") or len(results)
 
-                    url = data.get("next")
+                        for item in results:
+                            ds = normalize_repository(item, self.source_name)
+                            if ds is not None and post_filter(ds, req.filters):
+                                records.append(ds)
+                                if len(records) >= req.limit:
+                                    break
+
+                        page_url = data.get("next")
+                    # Non-empty candidate → stop; only fall back when it yielded
+                    # nothing (AND-search returned zero for the whole query).
+                    if len(records) > 0:
+                        break
 
                 truncated = total_available > len(records)
 

@@ -55,10 +55,6 @@ class NITRCConnector(BaseConnector):
     def source_name(self) -> str:
         return "nitrc"
 
-    async def fetch(self, limit: int = 200) -> list[dict[str, Any]]:
-        # §2.12 marks nitrc as S (search-only) — batch sync not required.
-        raise NotImplementedError("nitrc is a search-only connector (S) in v0.2")
-
     @connector_retry
     async def _get_json(self, url: str) -> dict | list:
         resp = await self._client.get(url)
@@ -84,11 +80,14 @@ class NITRCConnector(BaseConnector):
                     url = f"{NITRC_PROJECTS_FEED}?q={quote(query_terms)}"
                     data = await self._get_json(url)
 
-                    # Feed shape varies — accept list, {"results": [...]}, or {"projects": [...]}.
+                    # Confirmed live shape (2026-08-04): {"ResultSet": {"Result": [...]}}
+                    # — also accept list / {"results"|"projects"|"data"} for robustness.
                     if isinstance(data, list):
                         results = data
                     elif isinstance(data, dict):
-                        results = data.get("results") or data.get("projects") or data.get("data") or []
+                        results = (
+                            data.get("ResultSet") or {}
+                        ).get("Result") or data.get("results") or data.get("projects") or data.get("data") or []
                     else:
                         results = []
 

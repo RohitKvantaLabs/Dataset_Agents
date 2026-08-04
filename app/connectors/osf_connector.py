@@ -39,6 +39,11 @@ logger = logging.getLogger("neuro_platform.connectors.osf")
 OSF_API_BASE = "https://api.osf.io/v2"
 PAGE_SIZE = 25
 
+# OSF removed the aggregated /search endpoint (404 since ~2024). The live
+# searchable path is /registrations/?q=<terms>&filter[category]=data
+# (confirmed 2026-08-04: 200 with q= + category=data).
+OSF_REGISTRATIONS_PATH = "/registrations/"
+
 
 class OSFConnector(BaseConnector):
     """Search-capable connector for OSF data registrations/nodes."""
@@ -55,10 +60,6 @@ class OSFConnector(BaseConnector):
     @property
     def source_name(self) -> str:
         return "osf"
-
-    async def fetch(self, limit: int = 200) -> list[dict[str, Any]]:
-        # §2.11 marks osf as S (search-only) — batch sync not required.
-        raise NotImplementedError("osf is a search-only connector (S) in v0.2")
 
     @connector_retry
     async def _get_json(self, url: str) -> dict:
@@ -78,31 +79,25 @@ class OSFConnector(BaseConnector):
                 query_terms = self.build_query_terms(req)
                 page = 1
                 max_pages = get_max_pages()
-                used_search_endpoint = False
 
                 while len(records) < req.limit and page <= max_pages:
                     await self._limiter.acquire()
 
-                    # Primary: /search/?q=... (aggregated search). Fallback:
-                    # /registrations/?filter[category]=data paginated.
-                    if page == 1 and not used_search_endpoint:
-                        url = f"{OSF_API_BASE}/search/?q={quote(query_terms)}&filter[category]=data"
-                        try:
-                            data = await self._get_json(url)
-                        except httpx.HTTPStatusError as exc:
-                            if exc.response.status_code >= 400:
-                                logger.warning(
-                                    "OSF /search endpoint failed (%s) — falling back to /registrations/",
-                                    exc.response.status_code,
-                                )
-                                used_search_endpoint = True
-                                url = f"{OSF_API_BASE}/registrations/?filter[category]=data&page={page}&page_size={PAGE_SIZE}"
-                                data = await self._get_json(url)
-                            else:
-                                raise
+                    # Primary: /registrations/?q=<terms>&filter[category]=data
+                    # (OSF /search endpoint no longer exists — 404). When no
+                    # query terms are present, paginate registrations directly.
+                    if query_terms:
+                        url = (
+                            f"{OSF_API_BASE}{OSF_REGISTRATIONS_PATH}"
+                            f"?q={quote(query_terms)}&filter[category]=data"
+                            f"&page={page}&page_size={PAGE_SIZE}"
+                        )
                     else:
-                        url = f"{OSF_API_BASE}/registrations/?filter[category]=data&page={page}&page_size={PAGE_SIZE}"
-                        data = await self._get_json(url)
+                        url = (
+                            f"{OSF_API_BASE}{OSF_REGISTRATIONS_PATH}"
+                            f"?filter[category]=data&page={page}&page_size={PAGE_SIZE}"
+                        )
+                    data = await self._get_json(url)
 
                     results = data.get("data", [])
                     meta = data.get("meta", {})

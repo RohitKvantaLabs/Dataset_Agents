@@ -57,10 +57,6 @@ class NeuroVaultConnector(BaseConnector):
     def source_name(self) -> str:
         return "neurovault"
 
-    async def fetch(self, limit: int = 200) -> list[dict[str, Any]]:
-        # §2.6 marks neurovault as S (search-only) — batch sync not required.
-        raise NotImplementedError("neurovault is a search-only connector (S) in v0.2")
-
     @connector_retry
     async def _get_json(self, url: str) -> dict:
         resp = await self._client.get(url)

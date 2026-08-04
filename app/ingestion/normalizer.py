@@ -26,7 +26,7 @@ Mapping rules (§2.2):
 - ``raw`` preserves the full upstream payload for Stage 7 provenance.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 from app.models.dataset import Dataset
@@ -36,11 +36,21 @@ logger = logging.getLogger("neuro_platform.ingestion.normalizer")
 
 
 def _parse_iso(value: str | None) -> datetime | None:
-    """Best-effort ISO8601 → datetime; returns None on any failure."""
+    """Best-effort ISO8601 → timezone-AWARE datetime; returns None on failure.
+
+    Stabilization (Phase 3, found 2026-08-04): some repositories return naive
+    timestamps with no offset (e.g. NeuroVault ``modify_date`` =
+    "2017-06-29 11:20:37.529906"). Mixing naive + aware datetimes in one pool
+    crashed Stage 6 dedup (``_winner_sort_key`` compares ``updated_at``), so
+    naive timestamps are normalized to UTC here.
+    """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)  # assume UTC for naive stamps
+        return dt
     except (ValueError, TypeError):
         return None
 
@@ -106,6 +116,12 @@ def _map_zenodo_access_right(value: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 # Batch mappers (raw → Dataset) — current schema, P4-1 prerequisite fix
 # ---------------------------------------------------------------------------
+
+# NOTE: _normalize_dandi/_normalize_openneuro are the LEGACY batch mappers for
+# the unused ``normalize()`` entry point (no live caller). The live path is
+# ``normalize_repository`` → ``_repository_dandi`` (which handles the current
+# DANDI list-endpoint shape — title on the version object). Kept for reference.
+
 
 def _normalize_dandi(raw: dict) -> Dataset:
     meta = raw.get("metadata") or raw
@@ -223,12 +239,22 @@ def normalize(raw: dict, source_name: str) -> Dataset | None:
 # ---------------------------------------------------------------------------
 
 def _repository_dandi(raw: dict) -> RepositoryDataset | None:
-    meta = raw.get("metadata") or raw
+    # DANDI v2 list/search responses (verified live 2026-08-04) put the title
+    # and timestamps on the VERSION OBJECT itself (``draft_version.name``,
+    # ``draft_version.created``), NOT inside a nested ``metadata`` dict — the
+    # list endpoint returns no ``metadata`` key at all. Full-version endpoints
+    # (e.g. ``/dandisets/{id}/versions/draft/``) DO nest under ``metadata``.
+    # Resolution order: version.metadata → version object → raw (legacy).
+    version_obj = raw.get("draft_version") or raw.get("most_recent_published_version") or {}
+    version_meta = version_obj.get("metadata") or {}
+    meta = version_meta or version_obj or raw
     identifier = raw.get("identifier") or meta.get("identifier")
     if not identifier:
         return None
 
-    num = str(identifier).replace("DANDI:", "").lstrip("0") or identifier
+    # Keep the zero-padded identifier for the canonical URL — DANDI uses
+    # ``dandiset/000065`` style paths, not ``dandiset/65``.
+    num = str(identifier).replace("DANDI:", "")
     url = f"https://dandiarchive.org/dandiset/{num}"
     title = (
         _first_str(meta, "name")
@@ -243,6 +269,8 @@ def _repository_dandi(raw: dict) -> RepositoryDataset | None:
     if isinstance(licenses, list) and licenses:
         first = licenses[0] if isinstance(licenses[0], dict) else {}
         license_str = first.get("identifier") or first.get("name")
+    elif isinstance(licenses, dict):
+        license_str = licenses.get("identifier") or licenses.get("name")
 
     species = []
     for s in (meta.get("species") or []):
@@ -268,15 +296,27 @@ def _repository_dandi(raw: dict) -> RepositoryDataset | None:
         species=species,
         subject_count=meta.get("numberOfSubjects") or meta.get("number_of_subjects"),
         license=license_str,
-        version=_first_str(raw, "version"),
-        updated_at=_parse_iso(raw.get("modified") or raw.get("created")),
-        published_at=_parse_iso(raw.get("created")),
+        version=_first_str(raw, "version")
+        or _first_str(version_meta, "version")
+        or _first_str(version_obj, "version"),
+        updated_at=_parse_iso(
+            raw.get("modified")
+            or version_meta.get("modified")
+            or version_obj.get("modified")
+            or raw.get("created")
+        ),
+        published_at=_parse_iso(
+            version_meta.get("created") or version_obj.get("created") or raw.get("created")
+        ),
         raw=raw,
     )
 
 
 def _repository_openneuro(raw: dict) -> RepositoryDataset | None:
-    desc = raw.get("description") or {}
+    # Current-schema field paths (validated 2026-08-04): the free-text name/
+    # DOI/license live under ``latestSnapshot.description``; modalities/species
+    # under ``metadata`` (lowercase values, e.g. "mri", "eeg").
+    desc = (raw.get("latestSnapshot") or {}).get("description") or raw.get("description") or {}
     meta = raw.get("metadata") or {}
     ds_id = raw.get("id")
     if not ds_id:
@@ -302,8 +342,8 @@ def _repository_openneuro(raw: dict) -> RepositoryDataset | None:
         doi=_first_str(desc, "DatasetDOI"),
         authors=authors,
         version=_first_str(raw, "version"),
-        published_at=_parse_iso(raw.get("created")),
-        updated_at=_parse_iso(raw.get("modified") or raw.get("created")),
+        published_at=_parse_iso(raw.get("publishDate") or raw.get("created")),
+        updated_at=_parse_iso(raw.get("created")),
         raw=raw,
     )
 
@@ -405,12 +445,26 @@ def _repository_zenodo(raw: dict) -> RepositoryDataset | None:
     )
 
 
+def _strip_html(text: str | None) -> str | None:
+    """Strip HTML tags/entities from figshare title/description fields."""
+    if not text:
+        return None
+    import re as _re
+
+    cleaned = _re.sub(r"<[^>]+>", " ", str(text))
+    cleaned = _re.sub(r"&nbsp;|&amp;|&lt;|&gt;|&quot;", " ", cleaned)
+    return _re.sub(r"\s+", " ", cleaned).strip() or None
+
+
 def _repository_figshare(raw: dict) -> RepositoryDataset | None:
     art_id = raw.get("id")
     if art_id is None:
         return None
     url = raw.get("url_public_html") or f"https://figshare.com/articles/dataset/{art_id}"
-    title = _first_str(raw, "title") or f"Figshare Article {art_id}"
+    # Stabilization (Phase 1): figshare titles arrive HTML-encoded
+    # ("<b>WCAG 2.2 …</b>") — clean before returning so Stage 1 quality and
+    # the final ranked payload are human-readable.
+    title = _strip_html(_first_str(raw, "title")) or f"Figshare Article {art_id}"
     if not title:
         return None
 
@@ -429,7 +483,7 @@ def _repository_figshare(raw: dict) -> RepositoryDataset | None:
         source_id=str(art_id),
         url=url,
         title=title,
-        description=_first_str(raw, "description"),
+        description=_strip_html(_first_str(raw, "description")),
         keywords=_list_of_str(raw.get("tags")),
         license=(raw.get("license") or {}).get("name") if isinstance(raw.get("license"), dict) else None,
         doi=raw.get("doi"),
@@ -495,18 +549,25 @@ def _repository_osf(raw: dict) -> RepositoryDataset | None:
 
 
 def _repository_nitrc(raw: dict) -> RepositoryDataset | None:
-    pid = raw.get("id")
-    if pid is None:
+    # Live feed items (2026-08-04) carry ``secondary_ID`` (e.g. "NUDataSharing")
+    # and no numeric ``id``; fall back to name-derived slug when absent.
+    pid = raw.get("secondary_ID") or raw.get("id") or raw.get("slug")
+    if not pid:
         return None
-    slug = raw.get("slug") or str(pid)
-    url = f"https://www.nitrc.org/projects/{slug}"
-    title = _first_str(raw, "name") or _first_str(raw, "title") or f"NITRC Project {pid}"
+    slug = str(pid)
+    # Stabilization (Phase 1, confirmed live 2026-08-04): NITRC project URLs
+    # are CASE-SENSITIVE and lowercased — ``/projects/oasis3_av1451`` → 200,
+    # ``/projects/OASIS3_AV1451`` → 404. The feed's secondary_ID is uppercase,
+    # so the canonical URL must be lowercased or Stage 4 drops every NITRC
+    # record as a dead link.
+    url = f"https://www.nitrc.org/projects/{slug.lower()}"
+    title = _first_str(raw, "name") or _first_str(raw, "title") or f"NITRC Project {slug}"
     if not title:
         return None
 
     return RepositoryDataset(
         source="nitrc",
-        source_id=str(pid),
+        source_id=slug,
         url=url,
         title=title,
         description=_first_str(raw, "description"),
