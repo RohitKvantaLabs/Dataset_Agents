@@ -109,6 +109,149 @@ async def test_enrich_leaves_empty_when_no_vocab_token() -> None:
     assert kept[0].candidate.species == []
 
 
+# ── Metadata Integrity: context-aware extraction (Issue 2) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_enrich_ignores_incidental_portal_mentions() -> None:
+    # ds005892-style pollution (generic, no hardcoding): the title declares MRI;
+    # the description mentions MEG/EEG/iEEG ONLY inside the NEMAR viewing-portal
+    # blurb. The dataset must remain MRI.
+    rec = _Record(candidate=_dataset(
+        "Resting State MRI data from healthy control and Parkinson's disease cohorts",
+        description=(
+            "Resting-state fMRI data were collected at multiple sites. "
+            "View this dataset on the NEMAR OpenNeuro portal for MEG, iEEG, and EEG data."
+        ),
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    assert kept[0].candidate.modality == ["mri"]
+    assert kept[0].candidate.disease == "parkinson"
+
+
+@pytest.mark.asyncio
+async def test_enrich_ignores_software_and_viewer_mentions() -> None:
+    rec = _Record(candidate=_dataset(
+        "Clinical scores from a longitudinal cohort",
+        description=(
+            "The software supports MEG visualization and EEG analysis tools; "
+            "data are compatible with the NEMAR portal for viewing MEG signals."
+        ),
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    # "Supports MEG" / "MEG visualization" / "EEG analysis tools" / "portal for
+    # viewing MEG signals" describe tooling — never dataset modality.
+    assert kept[0].candidate.modality == []
+
+
+@pytest.mark.asyncio
+async def test_enrich_accepts_acquisition_context_in_description() -> None:
+    rec = _Record(candidate=_dataset(
+        "Auditory oddball paradigm",
+        description="MEG recordings were acquired at 1000 Hz from 30 subjects.",
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    assert kept[0].candidate.modality == ["meg"]
+
+
+@pytest.mark.asyncio
+async def test_enrich_keeps_multiple_labels_within_one_source() -> None:
+    rec = _Record(candidate=_dataset("MEG and EEG recordings of resting state"))
+    kept, _ = await _stage_enrich([rec], _settings())
+    assert set(kept[0].candidate.modality) == {"meg", "eeg"}
+
+
+@pytest.mark.asyncio
+async def test_enrich_accepts_analysis_and_library_phrasing() -> None:
+    # Ambiguous tooling words (analysis/library) are NOT signals — legitimate
+    # acquisition phrasing must not be false-rejected.
+    rec = _Record(candidate=_dataset(
+        "Error-related negativity study",
+        description="Single-trial EEG analysis of error-related negativity.",
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    assert "eeg" in kept[0].candidate.modality
+
+    rec2 = _Record(candidate=_dataset(
+        "Resting-state neuromagnetic recordings",
+        description="This dataset is part of an open library of MEG recordings.",
+    ))
+    kept2, _ = await _stage_enrich([rec2], _settings())
+    assert "meg" in kept2[0].candidate.modality
+
+
+# ── Metadata Integrity: confidence hierarchy (Issues 1/3/4) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_enrich_title_evidence_beats_description() -> None:
+    rec = _Record(candidate=_dataset(
+        "MEG recordings during motor imagery",
+        description="EEG and fMRI data from the same participants.",
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    # title (90) fills the field; lower-confidence description (40) evidence is
+    # never added.
+    assert kept[0].candidate.modality == ["meg"]
+    assert kept[0].enrichment["modality_source"] == "title"
+
+
+@pytest.mark.asyncio
+async def test_enrich_keywords_beat_description() -> None:
+    rec = _Record(candidate=_dataset(
+        "Multi-site resting-state study",
+        keywords=["magnetoencephalography"],
+        description="EEG recordings from patients.",
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    # keywords (85) > description (40)
+    assert kept[0].candidate.modality == ["meg"]
+    assert kept[0].enrichment["modality_source"] == "keywords"
+
+
+@pytest.mark.asyncio
+async def test_enrich_json_metadata_beats_free_text() -> None:
+    rec = _Record(candidate=_dataset(
+        "MEG study of motor cortex",
+        raw={"metadata": {"modalities": ["mri"]}},
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    # repository JSON metadata (95) outranks the title (90)
+    assert kept[0].candidate.modality == ["mri"]
+    assert kept[0].enrichment["modality_source"] == "json"
+
+
+@pytest.mark.asyncio
+async def test_enrich_json_species_fallback() -> None:
+    rec = _Record(candidate=_dataset(
+        "Resting-state recordings",
+        raw={"metadata": {"species": ["Human"]}},
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    assert "human" in kept[0].candidate.species
+    assert kept[0].enrichment["species_source"] == "json"
+
+
+@pytest.mark.asyncio
+async def test_enrich_never_overrides_declared_fields() -> None:
+    rec = _Record(candidate=_dataset(
+        "fMRI and MEG in human volunteers",
+        description="EEG data and PET imaging, compatible with the NEMAR portal.",
+        modality=["mri"],
+        species=["mouse"],
+        disease="parkinson",
+        region="hippocampus",
+    ))
+    kept, _ = await _stage_enrich([rec], _settings())
+    c = kept[0].candidate
+    # Repository-declared values (confidence 100) are never overwritten.
+    assert c.modality == ["mri"]
+    assert c.species == ["mouse"]
+    assert c.disease == "parkinson"
+    assert c.region == "hippocampus"
+    assert "vocab_modality" not in kept[0].enrichment_sources
+
+
 class TestVocabData:
     def test_modality_vocab_populated(self) -> None:
         assert "meg" in MODALITY_VOCAB

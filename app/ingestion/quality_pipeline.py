@@ -327,6 +327,161 @@ def _match_vocab_token(text: str, terms: list[str]) -> str | None:
     return None
 
 
+def _match_age_label(text: str) -> str | None:
+    """§3.3 — first AGE_TERMS label whose tokens match (confidence-ordered caller)."""
+    for label, tokens in (AGE_TERMS or {}).items():
+        if _match_vocab_token(text, tokens):
+            return label
+    return None
+
+
+def _match_disease_label(text: str) -> str | None:
+    """§3.3 — first DISEASE_TERMS label whose tokens match (confidence-ordered caller)."""
+    for label, tokens in (DISEASE_TERMS or {}).items():
+        if _match_vocab_token(text, tokens):
+            return label
+    return None
+
+
+# §3.3 (Metadata Integrity) — INTERNAL confidence order for vocabulary evidence.
+# Repository-declared values (already normalized onto the candidate) are tier
+# 100 and are NEVER overwritten; Stage 3 only fills empty fields. When a field
+# IS empty, the first non-empty evidence source below fills it exclusively —
+# lower-confidence evidence is never consulted once a higher-confidence source
+# produced a match, so incidental mentions in descriptive text can never add to
+# or replace title/keywords/repository-metadata evidence.
+#
+#   repository structured metadata       100   (candidate field, always wins)
+#   repository JSON metadata              95   (raw payload metadata subtree)
+#   repository dataset title              90
+#   repository keywords / tags            85
+#   repository abstract / description     40
+_ENRICHMENT_EVIDENCE_CONFIDENCE: dict[str, int] = {
+    "structured": 100,
+    "json": 95,
+    "title": 90,
+    "keywords": 85,
+    "description": 40,
+}
+
+# Sentences that describe a software platform / viewer / portal must never
+# produce dataset modalities (§3.3 Issue 2): "Supports MEG", "View with MEG",
+# "Portal for MEG", "Compatible with EEG", "MEG software", "MEG
+# visualization", "NEMAR OpenNeuro portal", "MEG analysis tools" all describe
+# tooling, NOT dataset acquisition. A modality token is only accepted when its
+# sentence carries none of these signals (word-boundary matching keeps
+# ``review`` / ``overview`` / ``BCI interface`` safe).
+#
+# The set is deliberately LIMITED to unambiguous tooling vocabulary: words that
+# are also common nouns for datasets or study activities (``analysis``,
+# ``library``, ``package``, ``application``, ``demo`` …) are NOT signals, so
+# legitimate acquisition sentences such as "single-trial EEG analysis" or "a
+# library of MEG recordings" are never false-rejected. Every must-not example
+# above is covered by the unambiguous members (e.g. "MEG analysis tools" is
+# caught by ``tools``, "NEMAR OpenNeuro portal" by ``nemar``/``portal``).
+_MODALITY_TOOL_SIGNALS: frozenset[str] = frozenset(
+    {
+        "portal", "software", "toolbox", "tool", "tools", "viewer", "viewers",
+        "visualization", "visualisation", "visualize", "visualise",
+        "visualizing", "visualising", "view", "views", "viewed", "viewing",
+        "supports", "support", "supported", "compatible", "platform", "nemar",
+        "plugin", "gui", "browser", "dashboard", "website", "webpage",
+        "web page", "powered by", "hosted on", "available on", "accessible via",
+        "tutorial",
+    }
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+")
+
+
+def _sentences(text: str) -> list[str]:
+    """Split free text into sentences (for per-sentence modality context checks)."""
+    return [s for s in _SENTENCE_SPLIT_RE.split(text or "") if s and s.strip()]
+
+
+def _modality_context_ok(sentence: str) -> bool:
+    """
+    True when *sentence* describes dataset acquisition rather than a software
+    platform/viewer. A sentence mentioning a tool/platform/portal keyword
+    (``portal for MEG``, ``view with MEG``, ``MEG analysis tools``, NEMAR)
+    describes the viewing platform — never the dataset — so its modality tokens
+    are ignored by ``_match_modality_vocab``.
+    """
+    sl = sentence.lower()
+    return not any(
+        re.search(rf"\b{re.escape(sig)}\b", sl) for sig in _MODALITY_TOOL_SIGNALS
+    )
+
+
+def _match_modality_vocab(text: str) -> list[str]:
+    """
+    Context-aware modality labels from free text (§3.3, Issue 2).
+
+    A modality token becomes a label only when its sentence passes
+    ``_modality_context_ok`` — mentions of MEG/EEG/iEEG inside portal, viewer,
+    or software sentences (e.g. the NEMAR viewing-portal blurb) never become
+    dataset modalities. Within one accepted sentence all matching labels are
+    kept (a dataset can legitimately be multi-modal).
+    """
+    labels: list[str] = []
+    sentences = [s.lower() for s in _sentences(text)]
+    for label, tokens in (MODALITY_VOCAB or {}).items():
+        for token in tokens or []:
+            t = str(token).strip().lower()
+            if not t:
+                continue
+            if any(
+                re.search(rf"\b{re.escape(t)}\b", s) and _modality_context_ok(s)
+                for s in sentences
+            ):
+                labels.append(label)
+                break
+    return labels
+
+
+def _json_declared_vocab(
+    candidate: RepositoryDataset, key: str, vocab: dict[str, list[str]]
+) -> list[str]:
+    """
+    Repository JSON metadata (confidence 95): modality/species declared in the
+    raw payload's ``metadata`` subtree (e.g. OpenNeuro
+    ``metadata.modalities = ["mri"]``) mapped through the vocab. Normalizers
+    usually populate the candidate field directly, so this is a generic
+    fallback for payloads where the candidate field was left empty — structured
+    JSON always outranks free-text evidence (title 90 > keywords 85 > description 40).
+    """
+    raw = candidate.raw or {}
+    meta = raw.get("metadata") if isinstance(raw, dict) else None
+    if not isinstance(meta, dict):
+        return []
+    value = meta.get(key)
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = [v for v in value if isinstance(v, str)]
+    else:
+        return []
+    return _match_vocab_labels(" ".join(values).lower(), vocab)
+
+
+def _first_vocab_evidence(
+    evidence: list[tuple[str, list[str] | str | None]],
+) -> tuple[list[str] | str | None, str]:
+    """
+    First (source, value) whose value is non-empty, from a confidence-ordered
+    evidence list — lower-confidence sources are never consulted once a
+    higher-confidence source produced a match (§3.3 Metadata Integrity).
+    """
+    for source, value in evidence:
+        if value:
+            logger.debug(
+                "vocab evidence selected: source=%s confidence=%s",
+                source, _ENRICHMENT_EVIDENCE_CONFIDENCE.get(source),
+            )
+            return value, source
+    return None, ""
+
+
 # ───────────────────────────── Stage 1 — Filter ─────────────────────────────
 
 
@@ -592,9 +747,15 @@ async def _stage_enrich(records: list[_Record], settings) -> tuple[list[_Record]
     for rec in records:
         rec.enrichment_started_at = datetime.now(timezone.utc)
         c = rec.candidate
-        text = " ".join(
-            [c.title or "", c.description or "", " ".join(c.keywords or []), c.doi or ""]
-        ).lower()
+        # §3.3 (Metadata Integrity) — evidence sources in confidence order
+        # (title 90 > keywords 85 > description 40). The candidate's declared
+        # fields (repository structured metadata, 100) and the raw payload's
+        # JSON metadata (95) are handled per-field below.
+        text_sources: list[tuple[str, str]] = [
+            ("title", (c.title or "").lower()),
+            ("keywords", " ".join(c.keywords or []).lower()),
+            ("description", (c.description or "").lower()),
+        ]
 
         # 1) Access tier — static lookup (§2.17); record-level override wins.
         if not c.access_tier:
@@ -618,34 +779,59 @@ async def _stage_enrich(records: list[_Record], settings) -> tuple[list[_Record]
                 c.size_label = label
                 rec.enrichment_sources.append("size_label")
 
-        # 5) Region / age_group / disease — vocab/pattern match only (no LLM).
+        # 5) Region / age_group / disease — vocab/pattern match only (no LLM),
+        #     confidence-ordered: repository title (90) > keywords (85) > description
+        #     (40). First non-empty source wins; declared values are never touched.
         if not c.region:
-            region = _match_vocab_token(text, REGION_TERMS)
-            if region:
-                c.region = region
+            value, src = _first_vocab_evidence(
+                [(name, _match_vocab_token(text, REGION_TERMS)) for name, text in text_sources]
+            )
+            if value:
+                c.region = value
                 rec.enrichment_sources.append("vocab_region")
+                rec.enrichment["region_source"] = src
         if not c.age_group:
-            for label, tokens in (AGE_TERMS or {}).items():
-                if _match_vocab_token(text, tokens):
-                    c.age_group = label
-                    rec.enrichment_sources.append("vocab_age")
-                    break
+            value, src = _first_vocab_evidence(
+                [(name, _match_age_label(text)) for name, text in text_sources]
+            )
+            if value:
+                c.age_group = value
+                rec.enrichment_sources.append("vocab_age")
+                rec.enrichment["age_source"] = src
         if not c.disease:
-            for label, tokens in (DISEASE_TERMS or {}).items():
-                if _match_vocab_token(text, tokens):
-                    c.disease = label
-                    rec.enrichment_sources.append("vocab_disease")
-                    break
+            value, src = _first_vocab_evidence(
+                [(name, _match_disease_label(text)) for name, text in text_sources]
+            )
+            if value:
+                c.disease = value
+                rec.enrichment_sources.append("vocab_disease")
+                rec.enrichment["disease_source"] = src
 
-        # 6) Modality / species fill — exact vocab match only when empty.
+        # 6) Modality / species fill — exact vocab match only when empty, with
+        #     the full confidence hierarchy: repository JSON metadata (95) > title
+        #     (90) > keywords (85) > description (40). Modality text evidence is
+        #     additionally context-checked (_match_modality_vocab): mentions inside
+        #     portal/viewer/software sentences never become dataset modalities.
         if not c.modality:
-            c.modality = _match_vocab_labels(text, MODALITY_VOCAB)
-            if c.modality:
+            evidence: list[tuple[str, list[str]]] = [
+                ("json", _json_declared_vocab(c, "modalities", MODALITY_VOCAB))
+            ]
+            evidence += [(name, _match_modality_vocab(text)) for name, text in text_sources]
+            value, src = _first_vocab_evidence(evidence)
+            if value:
+                c.modality = value
                 rec.enrichment_sources.append("vocab_modality")
+                rec.enrichment["modality_source"] = src
         if not c.species:
-            c.species = _match_vocab_labels(text, SPECIES_VOCAB)
-            if c.species:
+            evidence = [("json", _json_declared_vocab(c, "species", SPECIES_VOCAB))]
+            evidence += [
+                (name, _match_vocab_labels(text, SPECIES_VOCAB)) for name, text in text_sources
+            ]
+            value, src = _first_vocab_evidence(evidence)
+            if value:
+                c.species = value
                 rec.enrichment_sources.append("vocab_species")
+                rec.enrichment["species_source"] = src
 
         rec.enrichment_completed_at = datetime.now(timezone.utc)
 
