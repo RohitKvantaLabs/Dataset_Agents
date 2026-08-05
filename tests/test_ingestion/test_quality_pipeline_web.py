@@ -16,7 +16,11 @@ from app.config import Settings
 from app.ingestion.quality_pipeline import (
     WEB_DISCOVERY_SOURCE,
     _Record,
+    _classify_content_type,
+    _is_repository_landing_page,
+    _known_domain_host,
     _repo_identity_from_url,
+    _repo_native_class,
     _stage_filter,
     _stage_verify,
     run_quality_pipeline,
@@ -224,6 +228,38 @@ class TestStage4WebTrust:
         assert stats.accepted == 0
         assert stats.dropped.get("dead_link") == 1
 
+    @pytest.mark.asyncio
+    async def test_repository_homepage_never_promoted(self) -> None:
+        """Issue 2 — the OpenNeuro homepage (https://openneuro.org/) is a
+        landing page, NOT a dataset. It must be dropped at Stage 4 and can
+        never be promoted to a repository dataset / reach persistence."""
+        rec = _record(_web_candidate(url="https://openneuro.org/", title="OpenNeuro"))
+        with (
+            patch("app.config.get_settings", return_value=_settings()),
+            patch(
+                "app.agents.verification_agent.VerificationAgent._check_link",
+                new=AsyncMock(return_value=(True, "openneuro.org", _live_response())),
+            ),
+        ):
+            kept, stats = await _stage_verify([rec], _settings())
+        assert stats.accepted == 0
+        assert stats.dropped.get("repo_landing_page") == 1
+        assert kept == []
+
+    @pytest.mark.asyncio
+    async def test_repository_search_and_support_pages_dropped(self) -> None:
+        rec = _record(_web_candidate(url="https://openneuro.org/about", title="About OpenNeuro"))
+        with (
+            patch("app.config.get_settings", return_value=_settings()),
+            patch(
+                "app.agents.verification_agent.VerificationAgent._check_link",
+                new=AsyncMock(return_value=(True, "openneuro.org", _live_response())),
+            ),
+        ):
+            _, stats = await _stage_verify([rec], _settings())
+        assert stats.accepted == 0
+        assert stats.dropped.get("repo_landing_page") == 1
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: web candidate through the full pipeline (publish=True)
@@ -282,3 +318,114 @@ class TestWebCandidateFullPipeline:
         assert prov["discovery_count"] == 1
         assert prov["discovery_history"][0]["discovery_method"] == "web_search"
         assert prov["discovery_history"][0]["source"] == WEB_DISCOVERY_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_homepage_never_reaches_persistence(self) -> None:
+        """Issue 2/5 — with publish=True, a homepage candidate must be dropped
+        at Stage 4 so bulk_upsert is NEVER called for it (no Canonical
+        Persistence of landing pages), while a real dataset still publishes."""
+        homepage = _web_candidate(url="https://openneuro.org/", title="OpenNeuro")
+        real = _web_candidate(url="https://openneuro.org/datasets/ds000001", title="Real dataset")
+        calls: list[list] = []
+
+        async def fake_upsert(datasets: list):
+            calls.append(datasets)
+            return len(datasets)
+
+        with (
+            patch("app.config.get_settings", return_value=_settings()),
+            patch(
+                "app.agents.verification_agent.VerificationAgent._check_link",
+                new=AsyncMock(return_value=(True, "openneuro.org", _live_response())),
+            ),
+            patch("app.ingestion.quality_pipeline.bulk_upsert", new=fake_upsert),
+        ):
+            result = await run_quality_pipeline([homepage, real], publish=True)
+        assert len(result.datasets) == 1
+        assert result.datasets[0].source_id == "ds000001"
+        assert len(calls) == 1
+        assert [d.source_id for d in calls[0]] == ["ds000001"]
+        # The homepage is rejected at Stage 2 (classified as documentation);
+        # the real dataset is the only record that reaches persistence.
+        assert result.stages["classify"].dropped.get("documentation") == 1
+        assert result.stages["verify"].dropped.get("repo_landing_page", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Repository integrity — landing pages, known-domain matching, @type
+# ---------------------------------------------------------------------------
+
+
+class TestRepositoryIntegrity:
+    def test_known_domain_host_matches_subdomains(self) -> None:
+        # search.kg.ebrains.eu is the public KG Search host (under ebrains.eu);
+        # figshare portals are branded subdomains — both are known domains.
+        assert _known_domain_host("search.kg.ebrains.eu") is True
+        assert _known_domain_host("karger.figshare.com") is True
+        assert _known_domain_host("openneuro.org") is True
+        assert _known_domain_host("random-lab.example.com") is False
+
+    def test_repo_native_class_jsonld_atype(self) -> None:
+        """Issue 4 — the current EBRAINS Query API declares types via @type
+        (openMINDS Dataset / DatasetVersion IRIs). These must classify as
+        ``dataset`` — a related publication never downgrades them."""
+        assert _repo_native_class({"@type": ["https://openminds.ebrains.eu/core/DatasetVersion"]}) == "dataset"
+        assert _repo_native_class({"@type": "https://openminds.ebrains.eu/core/Dataset"}) == "dataset"
+        assert _repo_native_class({"@type": "https://openminds.ebrains.eu/core/SoftwareVersion"}) == "software"
+        assert _repo_native_class({"@type": "https://openminds.ebrains.eu/core/Model"}) is None
+
+    def test_repo_origin_homepage_classified_documentation(self) -> None:
+        rec = _record(
+            RepositoryDataset(
+                source="openneuro", source_id="home",
+                url="https://openneuro.org/", title="OpenNeuro",
+            )
+        )
+        assert _classify_content_type(rec, _settings()) == "documentation"
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # landing pages on supported repository domains → True
+            ("https://openneuro.org/", True),
+            ("https://openneuro.org/about", True),
+            ("https://openneuro.org/documentation/overview", True),
+            ("https://dandiarchive.org/", True),
+            ("https://www.nitrc.org/", True),
+            ("https://osf.io/", True),
+            ("https://figshare.com/", True),
+            ("https://figshare.com/search?q=meg", True),
+            ("https://search.kg.ebrains.eu/", True),
+            # actual dataset URLs → False
+            ("https://openneuro.org/datasets/ds000001", False),
+            ("https://dandiarchive.org/dandiset/000003", False),
+            ("https://zenodo.org/records/12345", False),
+            ("https://search.kg.ebrains.eu/instances/some-uuid", False),
+            ("https://osf.io/abcd1234/", False),
+            ("https://karger.figshare.com/articles/dataset/12345678", False),
+            # direct data links → False
+            ("https://openneuro.org/datasets/ds000001/files/sub-01_T1w.nii.gz", False),
+            # unknown domains → False (not a repository landing page)
+            ("https://example.edu/data", False),
+        ],
+    )
+    def test_is_repository_landing_page(self, url: str, expected: bool) -> None:
+        assert _is_repository_landing_page(url) is expected
+
+    @pytest.mark.asyncio
+    async def test_osf_and_figshare_homepages_never_promoted(self) -> None:
+        """Bare repository roots on osf.io / figshare.com are homepages — they
+        must be dropped, never promoted to a repository dataset."""
+        for url in ("https://osf.io/", "https://figshare.com/"):
+            rec = _record(_web_candidate(url=url, title=url))
+            with (
+                patch("app.config.get_settings", return_value=_settings()),
+                patch(
+                    "app.agents.verification_agent.VerificationAgent._check_link",
+                    new=AsyncMock(return_value=(True, "osf.io", _live_response())),
+                ),
+            ):
+                kept, stats = await _stage_verify([rec], _settings())
+            assert stats.accepted == 0, url
+            assert stats.dropped.get("repo_landing_page") == 1, url
+            assert kept == [], url

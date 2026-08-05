@@ -25,6 +25,7 @@ from app.agents.verification_agent import (
     _is_non_dataset,
 )
 from app.models.dataset import Dataset, TrustTier
+from app.models.query_filters import QueryFilters
 
 
 # ---------------------------------------------------------------------------
@@ -283,4 +284,32 @@ class TestSpecDocFilter:
         )
         result = await agent.verify([candidate])
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Issue 1 — structured metadata is never copied from the user's filters
+# ---------------------------------------------------------------------------
+
+
+class TestNoMetadataFabrication:
+
+    @pytest.mark.asyncio
+    async def test_filters_never_copied_into_verified_dataset(self) -> None:
+        """The user query (filters) must never fabricate modality/species/
+        keywords on a discovered dataset — those stay empty."""
+        agent = _make_agent(head_status=200)
+        filters = QueryFilters(
+            modality=["MEG"],
+            species=["human"],
+            condition=["Parkinson disease"],
+            task="resting-state",
+            keywords=["pd"],
+            raw_query="Find Parkinson disease MEG datasets",
+        )
+        result = await agent.verify([_make_candidate()], filters)
+        assert len(result) == 1
+        ds = result[0]
+        assert ds.modality == []
+        assert ds.species == []
+        assert ds.keywords == []
 

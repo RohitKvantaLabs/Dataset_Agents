@@ -184,23 +184,15 @@ class VerificationAgent:
             if domain in KNOWN_REPOSITORY_DOMAINS:
                 logger.info("Candidate %s is from a known repository domain", candidate.url)
 
-            # Extract modality, species and keywords from filters if available (ponytail: keep it minimal and case-consistent)
+            # Structured metadata is NEVER inferred from the user's filters —
+            # copying modality/species/keywords from the query onto a candidate
+            # would fabricate values the page may never contain (incorrect
+            # badges / ranking / persistence / provenance). Fields stay empty;
+            # the quality pipeline's Stage 3 enrichment fills them only from
+            # exact vocabulary matches in the candidate's own content.
             modality = []
             species = []
             keywords = []
-            if filters:
-                modality = [m.lower() for m in filters.modality] if filters.modality else []
-                species = [s.lower() for s in filters.species] if filters.species else []
-                kws = set()
-                if filters.condition:
-                    kws.update(c.lower() for c in filters.condition)
-                if filters.task:
-                    kws.add(filters.task.lower())
-                if filters.format:
-                    kws.update(f.lower() for f in filters.format)
-                if filters.keywords:
-                    kws.update(k.lower() for k in filters.keywords)
-                keywords = list(kws)
 
             try:
                 dataset = Dataset(

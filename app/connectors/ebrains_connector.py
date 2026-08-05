@@ -1,18 +1,30 @@
 """
-EBRAINS Knowledge Graph Connector (§2.7).
+EBRAINS Knowledge Graph Connector (§2.7) — current KG Core Query API.
 
-Knowledge Graph API: https://kg.ebrains.eu/api/instances/query
-Search: GET /instances/query?query=<query_terms>&page=<0-based>&size=<25>
-over dataset-type instances (filter ``type`` = dataset).
+Endpoint: ``POST https://core.kg.ebrains.eu/v3/queries`` (KG Core, production).
+The retired ``https://kg.ebrains.eu/api/instances/query`` endpoint is NO LONGER
+VALID — the current EBRAINS platform exposes the KG through KG Core at
+``core.kg.ebrains.eu`` with the current Query API / Instances API, while the
+public search UI is backed by the KG Search service at ``search.kg.ebrains.eu``
+(https://docs.kg.ebrains.eu — "OpenAPI specifications / Production").
 
-Auth: ``Authorization: Bearer <EBRAINS_API_KEY>`` (required).
-When the key is missing the connector does NOT skip silently — it returns
-an ``offline`` SearchResult with a reason (§2.7).
+The Query API executes a JSON-LD query payload (``meta.type`` + ``structure``
++ optional property ``filters``) and returns a PaginatedStreamResultJsonLdDoc:
+
+    {"data": [<instance JSON-LD docs>], "total": N, "size": S, "from": F, ...}
+
+Auth: ``Authorization: Bearer <EBRAINS_API_KEY>`` — an EBRAINS IAM access
+token (scopes ``openid email group profile roles team``). When the key is
+missing the connector does NOT skip silently — it returns an ``offline``
+SearchResult with a reason (§2.7).
+
+Pagination: ``from`` (0-based offset) and ``size`` query parameters; the
+response reports ``total`` for the truncated flag.
 """
+import copy
 import logging
+import re
 import time
-from typing import Any
-from urllib.parse import quote
 
 import httpx
 
@@ -37,8 +49,73 @@ _ebrains_circuit_breaker = CircuitBreaker(
 
 logger = logging.getLogger("neuro_platform.connectors.ebrains")
 
-EBRAINS_QUERY_URL = "https://kg.ebrains.eu/api/instances/query"
+# Current production KG Core Query API (docs.kg.ebrains.eu — "The Query API").
+EBRAINS_QUERY_URL = "https://core.kg.ebrains.eu/v3/queries"
 PAGE_SIZE = 25
+
+# Query only RELEASED instances — this is the content the public KG Search UI
+# surfaces (drafts are IN_PROGRESS and not publicly listed).
+EBRAINS_QUERY_STAGE = "RELEASED"
+
+# Query payload executed against the Query API. ``meta.type`` restricts the
+# traversal to openMINDS DatasetVersion instances (the documented example
+# type); ``structure`` selects the JSON-LD properties we normalize.
+# ``fullName``/``custodian`` are the exact vocab IRIs used in the official
+# docs examples; ``description``/``firstReleasedAt``/``license`` are openMINDS
+# DatasetVersion properties.
+EBRAINS_QUERY_TEMPLATE: dict = {
+    "@context": {
+        "@vocab": "https://core.kg.ebrains.eu/vocab/query/",
+        "path": {"@id": "path", "@type": "@id"},
+    },
+    "meta": {
+        "type": "https://openminds.ebrains.eu/core/DatasetVersion",
+    },
+    "structure": [
+        {"path": "@id"},
+        {"path": "https://openminds.ebrains.eu/vocab/fullName"},
+        {"path": "https://openminds.ebrains.eu/vocab/description"},
+        {"path": "https://openminds.ebrains.eu/vocab/firstReleasedAt"},
+        {
+            "path": "https://openminds.ebrains.eu/vocab/custodian",
+            "structure": {"path": "https://openminds.ebrains.eu/vocab/fullName"},
+        },
+        {
+            "path": "https://openminds.ebrains.eu/vocab/license",
+            "structure": {"path": "@id"},
+        },
+    ],
+}
+
+
+def _regex_filter_terms(terms: str) -> str | None:
+    """Build a documented REGEX property-filter value from the query terms.
+
+    The Query API has no free-text search parameter — keyword search is done
+    with per-property filters (docs: "Filters" → REGEX). We emit a
+    case-insensitive alternation over the individual terms so a title/abstract
+    containing ANY term matches (coarse server-side filtering; the retrieval
+    layer's post-filter + Stage-3 enrichment handle precision).
+    """
+    tokens = [t for t in re.split(r"\s+", terms.strip().lower()) if re.search(r"[a-z0-9]", t)]
+    if not tokens:
+        return None
+    escaped = "|".join(re.escape(t) for t in tokens)
+    return f"(?i).*(?:{escaped}).*"
+
+
+def _build_query_payload(terms: str) -> dict:
+    """Deep-copy the template and attach REGEX filters when terms exist."""
+    payload = copy.deepcopy(EBRAINS_QUERY_TEMPLATE)
+    pattern = _regex_filter_terms(terms)
+    if not pattern:
+        return payload
+    # Filter the title and the abstract/description (documented REGEX op).
+    for entry in payload["structure"]:
+        path = entry.get("path", "")
+        if path in ("https://openminds.ebrains.eu/vocab/fullName", "https://openminds.ebrains.eu/vocab/description"):
+            entry["filter"] = {"op": "REGEX", "value": pattern}
+    return payload
 
 
 class EBRAINSConnector(BaseConnector):
@@ -62,8 +139,8 @@ class EBRAINSConnector(BaseConnector):
         return "ebrains"
 
     @connector_retry
-    async def _get_json(self, url: str) -> dict:
-        resp = await self._client.get(url)
+    async def _post_json(self, url: str, body: dict, params: dict) -> dict:
+        resp = await self._client.post(url, json=body, params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -91,20 +168,46 @@ class EBRAINSConnector(BaseConnector):
 
         try:
             async with _ebrains_circuit_breaker:
-                query_terms = self.build_query_terms(req)
-                page = 0  # 0-based per §2.7
+                terms = self.build_query_terms(req)
+                page = 0
                 max_pages = get_max_pages()
+                size = min(PAGE_SIZE, max(req.limit, 1))
+                offset = 0
+                payload = _build_query_payload(terms)
+                payload_ok = True  # degrades to an unfiltered query on rejection
 
                 while len(records) < req.limit and page < max_pages:
                     await self._limiter.acquire()
 
-                    data = await self._get_json(
-                        f"{EBRAINS_QUERY_URL}?query={quote(query_terms)}&page={page}&size={PAGE_SIZE}"
-                    )
+                    params = {
+                        "from": offset,
+                        "size": size,
+                        "stage": EBRAINS_QUERY_STAGE,
+                        "returnTotalResults": "true",
+                    }
+                    try:
+                        data = await self._post_json(EBRAINS_QUERY_URL, payload, params)
+                    except httpx.HTTPStatusError as exc:
+                        # The REGEX filter is best-effort: if the server rejects
+                        # the filtered payload (4xx), retry once without filters
+                        # so dataset retrieval still works.
+                        if payload_ok and payload != EBRAINS_QUERY_TEMPLATE and 400 <= exc.response.status_code < 500:
+                            logger.warning(
+                                "EBRAINS rejected filtered query (%s) — retrying unfiltered",
+                                exc.response.status_code,
+                            )
+                            payload_ok = False
+                            payload = copy.deepcopy(EBRAINS_QUERY_TEMPLATE)
+                            continue
+                        raise
 
-                    # KG returns instances under various keys; be defensive.
-                    instances = data.get("data") or data.get("results") or data.get("instances") or []
-                    total_available = data.get("total") or data.get("totalElements") or len(instances)
+                    raw_data = data.get("data")
+                    instances = raw_data if isinstance(raw_data, list) else []
+                    total = data.get("total")
+                    if isinstance(total, int):
+                        total_available = total
+                    elif not total_available:
+                        total_available = len(instances)
 
                     for item in instances:
                         ds = normalize_repository(item, self.source_name)
@@ -113,7 +216,13 @@ class EBRAINSConnector(BaseConnector):
                             if len(records) >= req.limit:
                                 break
 
-                    if len(instances) < PAGE_SIZE:
+                    if not instances:
+                        break
+                    offset += len(instances)
+                    # Stop when a short page is also the last page (total known),
+                    # or when the server caps page size below our request and
+                    # more results remain (offset still below total).
+                    if len(instances) < size and (not total_available or offset >= total_available):
                         break
                     page += 1
 

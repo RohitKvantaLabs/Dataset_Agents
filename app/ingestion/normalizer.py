@@ -372,32 +372,80 @@ def _repository_neurovault(raw: dict) -> RepositoryDataset | None:
     )
 
 
+# EBRAINS KG Core returns JSON-LD instance docs. Property keys are either
+# compact openMINDS names (``fullName``) or expanded vocab IRIs
+# (``https://openminds.ebrains.eu/vocab/fullName``) — both are accepted.
+_EBRAINS_VOCAB_PREFIX = "https://openminds.ebrains.eu/vocab/"
+
+
+def _ebrains_vocab_str(raw: dict, prop: str) -> str | None:
+    """First string value for a compact or expanded openMINDS vocab property."""
+    if not isinstance(raw, dict):
+        return None
+    return _first_str(raw, prop, _EBRAINS_VOCAB_PREFIX + prop)
+
+
+def _ebrains_vocab_list(raw: dict, prop: str) -> list[str]:
+    """Extract a list-of-objects vocab property (e.g. custodian/license) into
+    strings, unwrapping each object's name-ish keys (fullName/givenName or @id)."""
+    if not isinstance(raw, dict):
+        return []
+    value = raw.get(prop) if raw.get(prop) is not None else raw.get(_EBRAINS_VOCAB_PREFIX + prop)
+    out: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                name = (
+                    _ebrains_vocab_str(item, "fullName")
+                    or _ebrains_vocab_str(item, "familyName")
+                    or _ebrains_vocab_str(item, "givenName")
+                    or _ebrains_vocab_str(item, "name")  # license instances carry name
+                    or _first_str(item, "@id", "id")
+                )
+                if name and str(name).strip():
+                    out.append(str(name).strip())
+            elif isinstance(item, str) and item.strip():
+                out.append(item.strip())
+    elif isinstance(value, str) and value.strip():
+        out.append(value.strip())
+    return out
+
+
 def _repository_ebrains(raw: dict) -> RepositoryDataset | None:
-    inst_id = raw.get("id")
+    # Current KG Core Query API instance docs carry ``@id`` (an instance IRI
+    # whose tail is the UUID) and openMINDS vocab property keys.
+    inst_id = raw.get("@id") or raw.get("id")
     if not inst_id:
         return None
     # KG instance id may be a full URL or a bare UUID — keep the tail.
     tail = str(inst_id).rstrip("/").split("/")[-1]
     url = f"https://search.kg.ebrains.eu/instances/{tail}"
     title = (
-        _first_str(raw, "displayName")
-        or _first_str(raw, "name")
-        or _first_str(raw, "title")
+        _ebrains_vocab_str(raw, "fullName")
+        or _ebrains_vocab_str(raw, "name")
+        or _first_str(raw, "displayName", "title")
         or f"EBRAINS Dataset {tail}"
     )
     if not title:
         return None
+
+    license_refs = _ebrains_vocab_list(raw, "license")
+    license_str = license_refs[0] if license_refs else None
 
     return RepositoryDataset(
         source="ebrains",
         source_id=tail,
         url=url,
         title=title,
-        description=_first_str(raw, "description"),
-        license=_first_str(raw, "license"),
-        authors=_list_of_str(raw.get("contributors") or raw.get("authors")),
-        updated_at=_parse_iso(raw.get("lastModified") or raw.get("modified")),
-        published_at=_parse_iso(raw.get("firstReleased") or raw.get("created")),
+        description=_ebrains_vocab_str(raw, "description"),
+        license=license_str,
+        authors=_ebrains_vocab_list(raw, "custodian") or _ebrains_vocab_list(raw, "authors"),
+        updated_at=_parse_iso(
+            _ebrains_vocab_str(raw, "lastReleasedAt") or _ebrains_vocab_str(raw, "modified")
+        ),
+        published_at=_parse_iso(
+            _ebrains_vocab_str(raw, "firstReleasedAt") or _ebrains_vocab_str(raw, "created")
+        ),
         raw=raw,
     )
 

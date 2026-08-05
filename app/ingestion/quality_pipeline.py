@@ -160,6 +160,7 @@ DATASET_PATH_MARKERS: tuple[str, ...] = (
     "/records/",
     "/collections/",
     "/projects/",
+    "/instances/",  # EBRAINS KG Search public dataset URLs (search.kg.ebrains.eu/instances/<uuid>)
 )
 
 # Markers that indicate a *collection of datasets* rather than a single one.
@@ -230,6 +231,56 @@ def _host_of(url: str) -> str:
 
 def _log_stage(name: str, stats: StageStats) -> None:
     logger.info("Stage %s: accepted=%d dropped=%s", name, stats.accepted, stats.dropped)
+
+
+def _is_repository_landing_page(url: str) -> bool:
+    """
+    True when a URL is a non-dataset page on a supported repository domain.
+
+    Repository integrity rule (§3.1/§3.4): only actual datasets may enter the
+    pipeline — never a repository homepage, support page, search page, login
+    page, documentation index, or any other landing page. Dataset URLs always
+    encode a native identifier in the path:
+
+    - a dataset path marker (/datasets/<id>, /dandiset/<id>, /records/<id>,
+      /collections/<id>, /projects/<id>, /instances/<id>), or
+    - a direct data-file link (BIDS marker / known data extension — checked
+      first), or
+    - an OSF node URL (https://osf.io/<node>/…) or figshare article URL
+      (/articles/<id>[/dataset]) whose path IS the dataset id.
+
+    Any other URL on a known repository domain (e.g. ``https://openneuro.org/``
+    or ``https://openneuro.org/about``) is a landing page → True.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001 — malformed URL must not abort
+        return False
+    host = _host_of(url)
+    if not host:
+        return False
+    known = set(KNOWN_REPOSITORY_DOMAINS) | set(SOURCE_HOSTS.values())
+    if not (host in known or any(host.endswith("." + h) for h in known if h and "." in h)):
+        return False
+    if _is_direct_link_by_path(url):
+        return False
+    path = (parsed.path or "").lower()
+    if any(m in path for m in DATASET_PATH_MARKERS):
+        return False
+    # A bare repository root (https://openneuro.org/, https://osf.io/,
+    # https://figshare.com/, …) is a homepage — never a dataset.
+    stripped = path.rstrip("/")
+    if not stripped:
+        return True
+    # OSF node URLs are single-segment paths (https://osf.io/<node>) that ARE
+    # dataset landing pages; any other OSF page is not a dataset URL.
+    if host == "osf.io" or host.endswith(".osf.io"):
+        return not re.fullmatch(r"/[^/]+", stripped)
+    # figshare dataset/article URLs live under /articles/; other figshare pages
+    # (homepage, search, account, …) are landing pages.
+    if host == "figshare.com" or host.endswith(".figshare.com"):
+        return not path.startswith("/articles/")
+    return True
 
 
 def _effective_allowlist(settings) -> frozenset[str]:
@@ -355,6 +406,13 @@ def _repo_native_class(raw: dict) -> str | None:
         v = raw.get(key)
         if isinstance(v, str):
             needles.append(v.lower())
+    # JSON-LD instances (EBRAINS KG Core Query API) declare their type via
+    # ``@type`` (a string or an array of IRIs, e.g. DatasetVersion).
+    atype = raw.get("@type")
+    if isinstance(atype, str):
+        needles.append(atype.lower())
+    elif isinstance(atype, list):
+        needles.extend(str(x).lower() for x in atype if isinstance(x, str))
     # OSF nodes/registrations declare category in attributes (e.g. "data").
     attrs = raw.get("attributes")
     if isinstance(attrs, dict) and isinstance(attrs.get("category"), str):
@@ -395,7 +453,13 @@ def _files_declare_dataset(files: list) -> bool:
 
 
 def _known_domain_host(host: str) -> bool:
-    return host in KNOWN_REPOSITORY_DOMAINS or host in set(SOURCE_HOSTS.values())
+    """True when *host* is a known repository domain (exact or any subdomain
+    of a canonical host — e.g. ``search.kg.ebrains.eu`` under ``ebrains.eu``,
+    ``karger.figshare.com`` under ``figshare.com``)."""
+    canonical = set(SOURCE_HOSTS.values())
+    if host in KNOWN_REPOSITORY_DOMAINS or host in canonical:
+        return True
+    return any(host.endswith("." + h) for h in canonical if h and "." in h)
 
 
 def _classify_content_type(rec: _Record, settings) -> str:
@@ -433,6 +497,12 @@ def _classify_content_type(rec: _Record, settings) -> str:
     native = _repo_native_class(c.raw)
     if native is not None:
         return native
+
+    # 3b) repository integrity: a URL that is a bare repository landing page
+    #     (homepage / support / search / login / documentation index) is never
+    #     a dataset — drop it outright instead of letting Stage 4 decide.
+    if _is_repository_landing_page(c.url):
+        return "documentation"
 
     # 4) file signals → dataset
     if c.files and _files_declare_dataset(c.files):
@@ -680,6 +750,16 @@ async def _stage_verify(records: list[_Record], settings) -> tuple[list[_Record]
             rec.is_direct_link = direct
             rec.last_verified_at = datetime.now(timezone.utc)
 
+            # Repository integrity (§3.4, before-persistence gate): the final
+            # (post-redirect) URL must represent an ACTUAL dataset. Repository
+            # homepages, support/search/login pages, and documentation indexes
+            # (e.g. ``https://openneuro.org/``) are never datasets and must
+            # never reach Canonical Persistence.
+            if _is_repository_landing_page(rec.candidate.url):
+                stats.drop("repo_landing_page")
+                logger.info("Stage 4 dropped repository landing page: %s", rec.candidate.url)
+                continue
+
             # Web-origin candidates whose verified destination URL belongs to a
             # supported repository domain become repository datasets (approved
             # decision). Runs before the trust check below, so the remapped
@@ -694,7 +774,8 @@ async def _stage_verify(records: list[_Record], settings) -> tuple[list[_Record]
                     rec.reclassified = True
                     # Promoted: the supported repository itself guarantees the
                     # record is a dataset (rule 3, §3.4) — no path-marker or
-                    # direct-link heuristic needed.
+                    # direct-link heuristic needed; the landing-page gate above
+                    # already rejected non-dataset repository URLs.
                     rec.class_label = "dataset"
                     logger.info(
                         "Stage 4 remapped web candidate to repository source=%s source_id=%s url=%s",

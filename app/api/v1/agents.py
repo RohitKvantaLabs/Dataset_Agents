@@ -75,6 +75,13 @@ def _web_candidate_to_repository_dataset(
     web-discovery source label) — never ``source_guess``. The guess is preserved
     in ``raw`` for provenance/debug only; trust is derived in Stage 4 from the
     verified destination URL + validated metadata.
+
+    ``filters`` (the parsed user query) is deliberately NOT used to populate any
+    structured metadata: copying modality/species/condition/task/region from the
+    query onto a discovered candidate would fabricate values the page may never
+    contain. Structured fields stay empty and are filled later only from
+    repository metadata, verified enrichment, ontology normalization, or the
+    candidate's own content (Stage 3).
     """
     url = (candidate.url or "").strip()
     if not url:
@@ -82,27 +89,22 @@ def _web_candidate_to_repository_dataset(
     title = (candidate.title or "Untitled dataset").strip() or "Untitled dataset"
     source_id = hashlib.sha1(url.encode()).hexdigest()[:16]
 
-    modality = [m.lower() for m in filters.modality] if filters.modality else []
-    species = [s.lower() for s in filters.species] if filters.species else []
-    keywords: list[str] = []
-    if filters.condition:
-        keywords.extend(c.lower() for c in filters.condition)
-    if filters.task:
-        keywords.append(filters.task.lower())
-    if filters.format:
-        keywords.extend(f.lower() for f in filters.format)
-    if filters.keywords:
-        keywords.extend(k.lower() for k in filters.keywords)
-
+    # Integrity rule: structured metadata (modality/species/condition/task/
+    # region/format/keywords) is NEVER copied from the user's query onto a
+    # discovered candidate. That would fabricate metadata the page may never
+    # contain (incorrect badges / ranking / persistence / provenance).
+    # Structured fields stay empty here; Stage 3 enrichment fills them ONLY
+    # from exact vocabulary matches in the candidate's own title/description/
+    # keywords, and Stage 4 derives trust from the verified destination URL.
     return RepositoryDataset(
         source=WEB_DISCOVERY_SOURCE,
         source_id=source_id,
         url=url,
         title=title,
         description=(candidate.reasoning or "Fallback candidate pending review"),
-        modality=modality,
-        species=species,
-        keywords=keywords,
+        modality=[],
+        species=[],
+        keywords=[],
         raw={"source_guess": candidate.source_guess, "discovery": "web"},
     )
 
