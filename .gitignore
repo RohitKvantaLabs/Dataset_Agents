@@ -29,6 +29,9 @@ venv/
 .idea/
 *.code-workspace
 
+
+
+
 # Temporary files
 *.swp
 *.swo
