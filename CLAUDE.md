@@ -1,5 +1,6 @@
 # CLAUDE.md — Neuro Data Discovery Platform: Python Agent Service
 
+
 This file is the source of truth for any AI coding agent (or human) picking up this repo.
 Read this fully before writing code. It encodes decisions that were made deliberately —
 don't "clean up" or "simplify" them without understanding why they're here first.
