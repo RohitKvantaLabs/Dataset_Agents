@@ -2,8 +2,6 @@
 .DS_Store
 Thumbs.db
 
-
-
 # Dependency directories
 node_modules/
 # Build output
