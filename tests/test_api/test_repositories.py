@@ -9,7 +9,8 @@ Covers:
 - internal-secret endpoints reject missing (422) / wrong (401) / accept correct (200)
 - cron endpoint rejects missing/wrong cron secret, accepts correct
 - response shapes match §4.6
-- repository-search runs quality pipeline with publish=False (no Mongo writes)
+- repository-search runs quality pipeline with publish=True, re-queries Mongo,
+  and returns the persisted canonical documents (with `_id`)
 - repository-sync returns per-source PipelineResult
 
 All connectors, quality pipeline, and Mongo counts are mocked — no real I/O.
@@ -82,10 +83,15 @@ class TestRepositorySearchAuth:
 
 
 class TestRepositorySearchResponse:
-    def test_response_shape_and_no_publish(
+    def test_response_shape_and_publish_mongo_documents(
         self, client: TestClient, auth_headers: dict
     ) -> None:
-        """§4.6 shape: query_id, sources_queried, total_found, elapsed_ms, datasets."""
+        """§4.6 canonical-persistence contract.
+
+        publish=True → re-query Mongo by the discovered identities → response
+        datasets are the persisted canonical documents (with ``_id``, provenance,
+        quality score), never transient in-memory pipeline previews.
+        """
         dataset = Dataset(
             title="ADHD resting fMRI",
             description="desc",
@@ -95,6 +101,13 @@ class TestRepositorySearchResponse:
             modality=["fMRI"],
             species=["human"],
         )
+        persisted = dataset.model_copy(
+            update={
+                "id": "66f0deadbeef000000000001",
+                "provenance": {"dedup_key": "dandi:DANDI:000003"},
+                "quality_score": 0.42,
+            }
+        )
         with (
             patch(
                 "app.api.v1.repositories.aggregate_repository_search",
@@ -103,7 +116,11 @@ class TestRepositorySearchResponse:
             patch(
                 "app.api.v1.repositories.run_quality_pipeline",
                 new=AsyncMock(return_value=_pipeline([dataset])),
-            ),
+            ) as mock_pipeline,
+            patch(
+                "app.api.v1.repositories.find_datasets_by_identity",
+                new=AsyncMock(return_value=[persisted]),
+            ) as mock_find,
         ):
             resp = client.post(
                 "/api/v1/agents/repository-search",
@@ -118,6 +135,15 @@ class TestRepositorySearchResponse:
         assert body["total_found"] == 1
         assert len(body["datasets"]) == 1
         assert body["datasets"][0]["source"] == "dandi"
+        # Mongo-backed record: _id present, provenance attached, quality score.
+        assert body["datasets"][0]["_id"] == "66f0deadbeef000000000001"
+        assert body["datasets"][0]["provenance"]["dedup_key"] == "dandi:DANDI:000003"
+        assert body["datasets"][0]["quality_score"] == 0.42
+        # Stage 7 publication is the persistence contract.
+        assert mock_pipeline.await_args.kwargs["publish"] is True
+        assert mock_pipeline.await_args.kwargs["discovery_method"] == "repository_search"
+        # Re-query used the discovered identities (post-run canonical keys).
+        assert mock_find.await_args.args[0] == [("dandi", "DANDI:000003")]
 
     def test_filters_are_passed_with_raw_query_injected(
         self, client: TestClient, auth_headers: dict
@@ -127,6 +153,10 @@ class TestRepositorySearchResponse:
         with (
             patch("app.api.v1.repositories.aggregate_repository_search", new=mock_aggregate),
             patch("app.api.v1.repositories.run_quality_pipeline", new=mock_pipeline),
+            patch(
+                "app.api.v1.repositories.find_datasets_by_identity",
+                new=AsyncMock(return_value=[]),
+            ),
         ):
             client.post(
                 "/api/v1/agents/repository-search",

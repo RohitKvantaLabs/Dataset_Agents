@@ -21,7 +21,7 @@ from app.config import get_settings
 from app.core.security import require_cron_secret, require_internal_secret
 from app.connectors.registry import get_circuit_state, get_enabled_sources
 from app.db.mongo import get_db
-from app.db.repositories.dataset_repository import COLLECTION_NAME
+from app.db.repositories.dataset_repository import COLLECTION_NAME, find_datasets_by_identity
 from app.ingestion.quality_pipeline import run_quality_pipeline
 from app.ingestion.repository_sync import run_repository_sync
 from app.models.dataset import Dataset
@@ -65,9 +65,21 @@ class RepositorySearchResponse(BaseModel):
 async def repository_search(payload: RepositorySearchRequest) -> RepositorySearchResponse:
     """
     Run enabled connectors in parallel → aggregate → quality pipeline
-    stages 1–6 (no publish) → return scored/deduped Dataset[].
+    stages 1–7 (publish) → re-query Mongo → return canonical documents.
 
-    Synchronous and bounded (limit_per_source, REPO_MAX_PAGES).
+    Canonical persistence contract (§4.6): every repository dataset shown to
+    the user must first be persisted into MongoDB (single source of truth).
+    Stage 7 bulk-upserts the surviving records idempotently — duplicate
+    handling unchanged ((source, source_id) key + DOI/URL canonical merge +
+    provenance history). After publication completes, Mongo is re-queried by
+    the discovered identities and the response carries the persisted
+    canonical documents (``_id``, provenance, quality score) — never
+    transient in-memory previews.
+
+    Synchronous and bounded (limit_per_source, REPO_MAX_PAGES). Everything
+    is awaited in-request (Vercel-serverless-safe): `bulk_upsert` finishes
+    before the response is returned, so any immediate re-query (here or on
+    the Node side) observes the writes.
     """
     settings = get_settings()
     filters = QueryFilters.model_validate({**payload.filters, "raw_query": payload.query})
@@ -83,15 +95,39 @@ async def repository_search(payload: RepositorySearchRequest) -> RepositorySearc
         _last_search_at[source] = time.time()
 
     pipeline = await run_quality_pipeline(
-        aggregate.records, filters, publish=False, discovery_method="repository_search"
+        aggregate.records, filters, publish=True, discovery_method="repository_search"
     )
+
+    # Canonical persistence: re-query Mongo by the identities Stage 7 just
+    # persisted. bulk_upsert mutates each dataset's (source, source_id) to its
+    # canonical identity when a URL/DOI merge re-targets it, so the post-run
+    # identities are the authoritative lookup keys.
+    seen: set[tuple[str, str]] = set()
+    identities: list[tuple[str, str]] = []
+    for d in pipeline.datasets:
+        key = (d.source, d.source_id)
+        if d.source and d.source_id and key not in seen:
+            seen.add(key)
+            identities.append(key)
+    datasets = await find_datasets_by_identity(identities) if identities else []
+    # Intentional graceful degradation: on a partial/zero re-query (Stage 7
+    # write failure or invisibility), the response is 200 with the subset of
+    # canonical docs that WERE persisted — never transient unpersisted
+    # previews. Node treats an empty repo pool as "repo tier found nothing"
+    # and degrades to the web tier, so no unpersisted dataset is surfaced.
+    if len(datasets) != len(identities):
+        logger.warning(
+            "repository_search: re-query returned %d/%d published identities",
+            len(datasets),
+            len(identities),
+        )
 
     return RepositorySearchResponse(
         query_id=uuid.uuid4().hex,
         sources_queried=aggregate.sources_queried,
-        total_found=len(pipeline.datasets),
+        total_found=len(datasets),
         elapsed_ms=pipeline.elapsed_ms,
-        datasets=pipeline.datasets,
+        datasets=datasets,
     )
 
 

@@ -368,6 +368,59 @@ async def upsert_many(datasets: list[Dataset]) -> int:
     return len(datasets)
 
 
+async def find_datasets_by_identity(pairs: list[tuple[str, str]]) -> list[Dataset]:
+    """
+    Fetch the canonical Mongo documents for a set of ``(source, source_id)``
+    identities and return them as Dataset models with ``id`` populated from
+    the document ``_id``.
+
+    Used by repository-search after Stage 7 publication: the pipeline
+    returns in-memory Datasets without ``_id``; this re-query returns the
+    persisted canonical documents (post canonical-merge identities, since
+    ``bulk_upsert`` mutates ``source``/``source_id`` when a URL/DOI merge
+    re-targets a record) so the API response carries Mongo-backed records
+    (``_id``, provenance, quality score) — the same shape subsequent cache
+    hits and ``getById`` serve.
+
+    Result order follows input order; duplicate identities collapse to one
+    document.
+    """
+    if not pairs:
+        return []
+    order: dict[tuple[str, str], int] = {}
+    keys: list[tuple[str, str]] = []
+    for pair in pairs:
+        if not pair[0] or not pair[1]:
+            continue
+        if pair not in order:
+            order[pair] = len(order)
+            keys.append(pair)
+    if not keys:
+        return []
+
+    db = get_db()
+    cursor = db[COLLECTION_NAME].find(
+        {"$or": [{"source": s, "source_id": i} for s, i in keys]}
+    )
+    docs = await cursor.to_list(length=len(keys))
+    out: list[Dataset] = []
+    for doc in docs:
+        # Project convention: swallow + log — one invalid stored document never
+        # aborts the whole re-query (and with it the entire repository-search
+        # response).
+        try:
+            out.append(Dataset.model_validate(doc))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "find_datasets_by_identity: skipping invalid doc (%s:%s): %s",
+                doc.get("source"),
+                doc.get("source_id"),
+                exc,
+            )
+    out.sort(key=lambda d: order.get((d.source, d.source_id), len(order)))
+    return out
+
+
 async def find_datasets_for_reverification(stale_before: datetime, limit: int) -> list[Dataset]:
     """
     Return verified/stale datasets whose links are due for scheduled re-check.

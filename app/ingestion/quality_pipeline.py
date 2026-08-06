@@ -8,7 +8,9 @@ Rules (from the architecture document):
 - Every stage is deterministic, independently testable, and never aborts
   the run on a single record failure (project convention: swallow + log).
 - Stage 7 (publication) is optional — ``publish=False`` for pure retrieval
-  previews (Phase 4 ``/agents/repository-search``).
+  previews (trace/analysis tooling only). ``/agents/repository-search`` now
+  publishes (``publish=True``): every repository dataset surfaced to the user
+  is first persisted into MongoDB (canonical persistence contract).
 - Controlled vocabularies come from ``app.data.vocab`` (structure-only,
   unimplemented until approved lists are provided). Empty vocab = no
   backfill; the pipeline degrades gracefully.
