@@ -14,6 +14,7 @@ from app.db.repositories.dataset_repository import (
     PROVENANCE_HISTORY_CAP,
     bulk_upsert,
     find_datasets_by_identity,
+    find_datasets_for_reverification,
     merge_provenance,
     normalize_doi,
     normalize_url_key,
@@ -311,6 +312,138 @@ class TestFindDatasetsByIdentity:
 
         assert [d.source for d in result] == ["openneuro"]
         assert result[0].id == "66f0ddd"
+
+    @pytest.mark.asyncio
+    async def test_real_bson_objectid_docs_all_validate_and_return(self) -> None:
+        """Regression: production Mongo stores `_id` as bson.ObjectId, which
+        pydantic v2 refuses to coerce to the Dataset model's str `id` field.
+        The repository layer must normalize ObjectId→str before validation so
+        every persisted document is returned by the canonical re-query."""
+        from bson import ObjectId
+
+        docs = [
+            {
+                "_id": ObjectId("66f0aaa00000000000000001"),
+                "source": "zenodo",
+                "source_id": "4938058",
+                "url": "https://zenodo.org/records/4938058",
+                "title": "Resting brain ALFF",
+                "modality": ["fmri"],
+                "species": [],
+                "keywords": [],
+                "trust_tier": "verified",
+                "quality_score": 0.69,
+                "provenance": {
+                    "source_repository": "zenodo",
+                    "dedup_key": "zenodo:4938058",
+                    "discovery_history": [
+                        {
+                            "source": "zenodo",
+                            "discovery_method": "repository_search",
+                            "source_api": "zenodo.org",
+                            "harvest_query": "resting state fMRI",
+                            "harvested_at": "2026-08-06T00:00:00+00:00",
+                            "pipeline_version": "v2",
+                        }
+                    ],
+                    "first_seen_at": "2026-08-06T00:00:00+00:00",
+                    "last_seen_at": "2026-08-06T00:00:00+00:00",
+                    "discovery_count": 1,
+                },
+                "last_verified_at": "2026-08-06T00:00:00+00:00",
+                "ingested_at": "2026-08-06T00:00:00+00:00",
+                "updated_at": "2026-08-06T00:00:00+00:00",
+            },
+            {
+                "_id": ObjectId("66f0bbb00000000000000002"),
+                "source": "openneuro",
+                "source_id": "ds000001",
+                "url": "https://openneuro.org/datasets/ds000001",
+                "title": "Balloon Analog Risk-taking Task",
+                "modality": ["mri"],
+                "species": [],
+                "keywords": [],
+                "trust_tier": "verified",
+                "quality_score": 0.47,
+            },
+        ]
+        collection = self._collection(docs)
+        db = MagicMock()
+        db.__getitem__ = MagicMock(return_value=collection)
+
+        with patch("app.db.repositories.dataset_repository.get_db", return_value=db):
+            result = await find_datasets_by_identity([("zenodo", "4938058"), ("openneuro", "ds000001")])
+
+        # BOTH documents validate and are returned — no silent skip.
+        assert len(result) == 2
+        assert [d.source for d in result] == ["zenodo", "openneuro"]
+        assert result[0].id == "66f0aaa00000000000000001"
+        assert result[1].id == "66f0bbb00000000000000002"
+        assert result[0].provenance["dedup_key"] == "zenodo:4938058"
+
+
+# ---------------------------------------------------------------------------
+# find_datasets_for_reverification — same ObjectId normalization
+# ---------------------------------------------------------------------------
+
+
+class TestFindDatasetsForReverification:
+    """The scheduled link re-verification cron deserializes stored docs with
+    the same boundary translation — a bson.ObjectId `_id` must validate as the
+    Dataset model's str `id` (previously this path RAISED on the first doc
+    because there is no swallow-and-log guard here)."""
+
+    @pytest.mark.asyncio
+    async def test_real_bson_objectid_docs_all_validate(self) -> None:
+        from datetime import datetime, timezone
+        from bson import ObjectId
+
+        docs = [
+            {
+                "_id": ObjectId("66f0ccc00000000000000003"),
+                "source": "zenodo",
+                "source_id": "4938058",
+                "url": "https://zenodo.org/records/4938058",
+                "title": "Resting brain ALFF",
+                "modality": ["fmri"],
+                "species": [],
+                "keywords": [],
+                "trust_tier": "verified",
+                "quality_score": 0.69,
+            },
+            {
+                "_id": ObjectId("66f0ddd00000000000000004"),
+                "source": "openneuro",
+                "source_id": "ds000001",
+                "url": "https://openneuro.org/datasets/ds000001",
+                "title": "Balloon Analog Risk-taking Task",
+                "modality": ["mri"],
+                "species": [],
+                "keywords": [],
+                "trust_tier": "verified",
+                "quality_score": 0.47,
+            },
+        ]
+        # find_datasets_for_reverification chains .find(...).limit(limit); the
+        # awaited to_list() lives on the .limit() return value.
+        collection = MagicMock()
+        limited = MagicMock()
+        limited.to_list = AsyncMock(return_value=docs)
+        collection.find = MagicMock(return_value=MagicMock(limit=MagicMock(return_value=limited)))
+        db = MagicMock()
+        db.__getitem__ = MagicMock(return_value=collection)
+
+        stale_before = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch("app.db.repositories.dataset_repository.get_db", return_value=db):
+            result = await find_datasets_for_reverification(stale_before, limit=2)
+
+        # Both docs deserialize — the cron path no longer aborts on ObjectId.
+        assert len(result) == 2
+        assert result[0].id == "66f0ccc00000000000000003"
+        assert result[1].id == "66f0ddd00000000000000004"
+        # The query targeted verified/stale docs due for re-check.
+        query = collection.find.call_args.args[0]
+        assert query["trust_tier"]["$in"] == ["verified", "stale"]
 
 
 # ---------------------------------------------------------------------------

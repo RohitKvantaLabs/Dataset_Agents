@@ -1,7 +1,9 @@
 import logging
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import urlparse
 
+from bson import ObjectId
 from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import BulkWriteError
 
@@ -37,6 +39,33 @@ COLLECTION_NAME = "datasets"
 # trim — oldest dropped first). Prevents unbounded document growth across
 # repeated synchronizations while preserving a complete recent history.
 PROVENANCE_HISTORY_CAP: int = 20
+
+
+def _normalize_doc(doc: Any) -> Any:
+    """
+    Repository-layer boundary translation: convert every ``bson.ObjectId``
+    value in a raw Mongo document to ``str`` before domain-model validation.
+
+    Stored documents carry ``_id`` as a ``bson.ObjectId``, but the pure
+    domain ``Dataset`` model declares string identifiers
+    (``id: str | None = Field(default=None, alias="_id")``). Pydantic v2
+    refuses to coerce ``ObjectId`` → ``str``, so without this normalization
+    every persisted document fails validation and is silently skipped by the
+    canonical re-query (``find_datasets_by_identity``) — collapsing the
+    repository search result to zero datasets.
+
+    The conversion is recursive so ObjectIds nested inside sub-documents or
+    arrays (e.g. provenance structures) are normalized too, and ``bson``
+    types never leak into business logic — this module is the only place
+    that touches them.
+    """
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    if isinstance(doc, dict):
+        return {k: _normalize_doc(v) for k, v in doc.items()}
+    if isinstance(doc, (list, tuple)):
+        return [_normalize_doc(v) for v in doc]
+    return doc
 
 
 def _derive_discovery_event(prov: dict, now: datetime) -> dict | None:
@@ -405,11 +434,12 @@ async def find_datasets_by_identity(pairs: list[tuple[str, str]]) -> list[Datase
     docs = await cursor.to_list(length=len(keys))
     out: list[Dataset] = []
     for doc in docs:
-        # Project convention: swallow + log — one invalid stored document never
-        # aborts the whole re-query (and with it the entire repository-search
-        # response).
+        # Repository boundary: stored `_id` is a bson.ObjectId; normalize to str
+        # so the pure domain Dataset model validates. Project convention:
+        # swallow + log — one invalid stored document never aborts the whole
+        # re-query (and with it the entire repository-search response).
         try:
-            out.append(Dataset.model_validate(doc))
+            out.append(Dataset.model_validate(_normalize_doc(doc)))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "find_datasets_by_identity: skipping invalid doc (%s:%s): %s",
@@ -442,7 +472,9 @@ async def find_datasets_for_reverification(stale_before: datetime, limit: int) -
         .limit(limit)
     )
     docs = await cursor.to_list(length=limit)
-    return [Dataset.model_validate(doc) for doc in docs]
+    # Repository boundary: stored `_id` is a bson.ObjectId; normalize to str so
+    # the pure domain Dataset model validates.
+    return [Dataset.model_validate(_normalize_doc(doc)) for doc in docs]
 
 
 async def update_verification_status(dataset: Dataset, trust_tier: TrustTier, verified_at: datetime) -> None:
