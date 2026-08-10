@@ -29,11 +29,14 @@ from datetime import datetime, timezone
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.catalog.normalize import build_source_record
+from app.catalog.normalize import build_dandi_source_record, build_source_record
 from app.catalog.persistence import get_collection, upsert_canonical
 from app.catalog.schema import CATALOG_COLLECTION
 
 logger = logging.getLogger("neuro_platform.catalog.ingest")
+
+# DANDI Archive public REST API.
+DANDI_API_BASE = "https://api.dandiarchive.org/api"
 
 GRAPHQL_URL = "https://openneuro.org/crn/graphql"
 
@@ -367,3 +370,231 @@ def _validate_source(source: dict) -> list[str]:
     if age_group and not ages:
         errs.append("ageGroup present without ages (fabrication guard)")
     return errs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DANDI Phase-1 ingestion
+#
+# Flow (spec — DANDI scope):
+#     list → Dandiset IDs → draft version endpoint → full Dandiset metadata
+#     → normalization → canonical identity resolution → persistence
+#
+# Rich scientific metadata is read ONLY from the draft VERSION endpoint — never
+# from the list endpoint. Phase 1 deliberately performs ZERO asset-level calls.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_dandi_list_id(identifier) -> str | None:
+    """Normalize a list-endpoint dandiset identifier ('DANDI:000003'/'000003') → '000003'."""
+    if not identifier:
+        return None
+    return str(identifier).strip().replace("DANDI:", "").strip() or None
+
+
+def make_dandi_fetchers(retry_counter: list[int]):
+    """Build retry-wrapped DANDI fetchers.
+
+    ``retry_counter`` is appended to on every actual retry attempt so the
+    report can distinguish real retries from hard failures.
+    """
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=lambda retry_state: retry_counter.append(1),
+    )
+    async def fetch_list_page(client: httpx.AsyncClient, url: str) -> dict:
+        """One /api/dandisets/ page (list-only — no scientific metadata)."""
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=lambda retry_state: retry_counter.append(1),
+    )
+    async def fetch_version(client: httpx.AsyncClient, dandiset_id: str) -> dict:
+        """GET /api/dandisets/{id}/versions/draft/ — the Phase-1 metadata source."""
+        resp = await client.get(f"{DANDI_API_BASE}/dandisets/{dandiset_id}/versions/draft/")
+        resp.raise_for_status()
+        return resp.json()
+
+    return fetch_list_page, fetch_version
+
+
+async def run_dandi_ingestion(
+    db,
+    *,
+    target: int | None = None,
+    page_size: int = 100,
+    page_delay: float = 0.6,
+    list_page_delay: float = 0.3,
+    client: httpx.AsyncClient | None = None,
+    log=print,
+) -> dict:
+    """Ingest all public DANDI dandisets into the canonical catalog (Phase 1).
+
+    Enumerates all Dandiset IDs, fetches the draft VERSION metadata for each,
+    normalizes into the canonical per-source record, validates, then defers to
+    the existing dedup → insert/merge persistence. ``target`` caps the number
+    of version records processed (e.g. ``--limit 10`` smoke test).
+
+    NEVER calls any asset-level endpoint (``asset_calls`` stays 0).
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "dandi",
+        "discovered": 0,
+        "retrieved": 0,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_failures": 0,
+        "api_error_details": [],
+        "retries": 0,
+        "pages": 0,
+        "list_requests": 0,
+        "version_requests": 0,
+        "asset_calls": 0,          # Phase 1 never touches asset endpoints
+        "total_api_calls": 0,
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+        "target": target,
+    }
+
+    t0 = time.monotonic()
+    retry_counter: list[int] = []
+    fetch_list_page, fetch_version = make_dandi_fetchers(retry_counter)
+    owns_client = client is None
+    async with (client or httpx.AsyncClient(timeout=90)) as c:
+        # ── 1) Enumerate all Dandiset IDs (list endpoint only). ─────────────
+        dandisets: list[tuple[str, dict]] = []  # (dandiset_id, list_record)
+        url: str | None = f"{DANDI_API_BASE}/dandisets/?page_size={page_size}"
+        consecutive_failures = 0
+        while url:
+            if target is not None and len(dandisets) >= target:
+                break
+            stats["pages"] += 1
+            stats["list_requests"] = stats["pages"]
+            try:
+                data = await fetch_list_page(c, url)
+                consecutive_failures = 0
+            except Exception as exc:  # noqa: BLE001 — page-level failure
+                stats["api_failures"] += 1
+                stats["api_error_details"].append(
+                    f"list page {stats['pages']}: {type(exc).__name__}: {exc}"
+                )
+                log(f"[dandi] list page {stats['pages']} failed: {type(exc).__name__}: {exc}")
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    log("[dandi] too many consecutive list failures — aborting enumeration")
+                    break
+                await asyncio.sleep(list_page_delay * 2)
+                continue
+            stats["retries"] = len(retry_counter)
+            for rec in data.get("results") or []:
+                ds_id = _normalize_dandi_list_id(rec.get("identifier"))
+                if not ds_id:
+                    continue
+                dandisets.append((ds_id, rec))
+                if target is not None and len(dandisets) >= target:
+                    break
+            stats["discovered"] = len(dandisets)
+            url = data.get("next")
+            if url:
+                await asyncio.sleep(list_page_delay)
+
+        # ── 2) Fetch + normalize + validate + dedup + persist each version. ─
+        for ds_id, list_rec in dandisets:
+            if target is not None and stats["retrieved"] >= target:
+                break
+            stats["version_requests"] += 1
+            try:
+                version = await fetch_version(c, ds_id)
+            except Exception as exc:  # noqa: BLE001
+                stats["api_failures"] += 1
+                stats["failure_details"].append(f"{ds_id}: fetch_version: {type(exc).__name__}: {exc}")
+                log(f"[dandi] version fetch failed for {ds_id}: {type(exc).__name__}: {exc}")
+                continue
+            stats["retrieved"] += 1
+            stats["retries"] = len(retry_counter)
+
+            published = list_rec.get("most_recent_published_version") or {}
+            try:
+                source = build_dandi_source_record(version, published)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{ds_id}: normalize: {exc}")
+                continue
+            stats["normalized"] += 1
+
+            errs = _validate_source(source)
+            if errs:
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(f"{ds_id}: {errs[0]}")
+                log(f"[dandi] validation failed for {ds_id}: {errs}")
+                continue
+            stats["validated_ok"] += 1
+
+            try:
+                result = await upsert_canonical(collection, source)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{ds_id}: upsert: {exc}")
+                log(f"[dandi] upsert failed for {ds_id}: {exc}")
+                continue
+
+            if result.get("action") == "invalid":
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(
+                    f"{ds_id}: {result.get('errors', [])[:2]}"
+                )
+                log(f"[dandi] canonical validation failed for {ds_id}")
+                continue
+
+            if result["action"] == "inserted":
+                stats["inserted"] += 1
+            else:
+                stats["merged"] += 1
+                via = result.get("matchedVia") or "unknown"
+                stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+            ambiguous = result.get("ambiguousCandidates") or []
+            if ambiguous:
+                stats["ambiguous_candidates"] += len(ambiguous)
+                if len(stats["ambiguous_sample"]) < 10:
+                    stats["ambiguous_sample"].append(
+                        {
+                            "source": f"dandi:{source['sourceDatasetId']}",
+                            "candidates": [
+                                cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                            ],
+                        }
+                    )
+
+            await asyncio.sleep(page_delay)  # rate limit — do not hammer DANDI
+
+    stats["asset_calls"] = 0  # hard guarantee: no asset-level crawling
+    stats["total_api_calls"] = stats["list_requests"] + stats["version_requests"]
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[dandi] done: discovered={stats['discovered']} retrieved={stats['retrieved']} "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats

@@ -230,10 +230,27 @@ async def build_report(db, stats: dict, docs: list[dict], prod_collection) -> di
 
     total_unique = len(docs)
     total_source_records = sum(len(d.get("sources") or []) for d in docs)
+    repository = stats.get("repository", "openneuro")
+    if repository == "dandi":
+        dedup_note = (
+            "DANDI Phase-1 run: source identity is repository='dandi' + "
+            "sourceDatasetId. No DANDI version DOI is used as canonical identity "
+            "(draft DOIs are placeholders; published version DOIs are preserved "
+            "as provenance only). Cross-repository merges activate only via "
+            "strong signals (DOI / URL / strong multi-field) — no aggressive "
+            "fuzzy matching; uncertain identities stay separate."
+        )
+    else:
+        dedup_note = (
+            "This OpenNeuro-only run establishes the dedup framework. "
+            "Cross-repository merges (DOI/URL/strong multi-field) will "
+            "activate when NEMAR/DANDI/... sources are ingested."
+        )
     report = {
         "report_generated_at": _utcnow(),
         "catalog_collection": CATALOG_COLLECTION,
         "A_INGESTION": {
+            "repository": repository,
             "total_datasets_discovered": stats.get("discovered", 0),
             "total_datasets_retrieved": stats.get("retrieved", 0),
             "total_successfully_normalized": stats.get("normalized", 0),
@@ -245,6 +262,10 @@ async def build_report(db, stats: dict, docs: list[dict], prod_collection) -> di
             "total_retries": stats.get("retries", 0),
             "per_node_graphql_errors": stats.get("per_node_graphql_errors", 0),
             "pagination_pages": stats.get("pages", 0),
+            "list_api_requests": stats.get("list_requests", stats.get("pages", 0)),
+            "version_api_requests": stats.get("version_requests", 0),
+            "total_api_calls": stats.get("total_api_calls", 0),
+            "asset_level_api_calls": stats.get("asset_calls", 0),
             "total_ingestion_time_s": stats.get("elapsed_s"),
             "started_at": stats.get("started_at"),
             "finished_at": stats.get("finished_at"),
@@ -263,11 +284,7 @@ async def build_report(db, stats: dict, docs: list[dict], prod_collection) -> di
             "sources_per_record_avg": round(total_source_records / total_unique, 3) if total_unique else 0.0,
             "ambiguous_identities_not_merged": stats.get("ambiguous_candidates", 0),
             "ambiguous_sample": stats.get("ambiguous_sample", []),
-            "note": (
-                "This OpenNeuro-only run establishes the dedup framework. "
-                "Cross-repository merges (DOI/URL/strong multi-field) will "
-                "activate when NEMAR/DANDI/... sources are ingested."
-            ),
+            "note": dedup_note,
         },
         "C_METADATA_COVERAGE": coverage,
         "D_NORMALIZATION": normalization,

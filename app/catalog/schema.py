@@ -192,17 +192,21 @@ def derive_age_groups(ages: list[float] | None) -> list[str] | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LICENSE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    # CC0 / CCO / equivalent variants → cc0
+    # CC0 / CCO / equivalent variants → cc0. Matches plain text ("CC0 1.0")
+    # AND SPDX ids ("spdx:CC0-1.0" — "\bcc0\b" is a word boundary before the
+    # colon/hyphen).
     (LICENSE_CC0, re.compile(r"\bcc0\b|\bcco\b|creative commons 0|cc 0 universal|public domain \(cc0\)")),
     # PDDL / PPDL / Public Domain Dedication variants → pddl
     (
         LICENSE_PDDL,
         re.compile(r"\bpddl\b|\bppdl\b|public domain dedication|opendatacommons\.org/licenses/pddl|odc-pddl"),
     ),
-    # CC BY-NC (4.0 and relatives) → cc-by-nc-4.0
-    (LICENSE_CC_BY_NC_4, re.compile(r"cc by[- ]nc|creative commons (attribution[- ]non[ -]commercial|noncommercial)")),
-    # CC BY → cc-by-4.0
-    (LICENSE_CC_BY_4, re.compile(r"cc by\b|creative commons attribution|creative commons by\b")),
+    # CC BY-NC (4.0 and relatives) → cc-by-nc-4.0. Handles hyphenated SPDX
+    # ("spdx:CC-BY-NC-4.0") and space/hyphen prose ("CC BY-NC 4.0").
+    (LICENSE_CC_BY_NC_4, re.compile(r"cc[- ]by[- ]nc|creative commons (attribution[- ]non[ -]commercial|noncommercial)")),
+    # CC BY → cc-by-4.0. "\bcc0\b"-style SPDX ("spdx:CC-BY-4.0") is covered by
+    # the "cc[- ]by[- ]4" branch; plain "CC BY" prose keeps matching "cc by\b".
+    (LICENSE_CC_BY_4, re.compile(r"cc by\b|cc[- ]by[- ]4|creative commons attribution|creative commons by\b")),
     # Plain public domain / PD → pddl (closest canonical public-domain label)
     (LICENSE_PDDL, re.compile(r"^public domain$|^pd$|\bpublic domain\b")),
 )

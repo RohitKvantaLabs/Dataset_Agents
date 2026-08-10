@@ -35,6 +35,46 @@ from app.catalog.schema import (
 from app.data.vocab import MODALITY_VOCAB, SPECIES_VOCAB
 
 REPOSITORY = "openneuro"
+DANDI_REPOSITORY = "dandi"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DANDI modality derivation — deterministic rules ONLY (never LLM, never
+# inferred from title/description). Mapped from assetsSummary.approach[] and
+# assetsSummary.measurementTechnique[] (spec §2.5/C for DANDI).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (canonical modality label, matching raw approach/technique tokens)
+DANDI_MODALITY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "electrophysiology",
+        (
+            "electrophysiological approach",
+            "spike sorting technique",
+            "multi electrode extracellular electrophysiology recording technique",
+        ),
+    ),
+    (
+        "behavior",
+        (
+            "behavioral approach",
+            "behavioral technique",
+        ),
+    ),
+    (
+        "imaging",
+        (
+            "microscopy approach; cell population imaging",
+            "two-photon microscopy technique",
+            "one-photon microscopy technique",
+        ),
+    ),
+    (
+        "optogenetics",
+        (
+            "optogenetic approach",
+        ),
+    ),
+)
 
 # Modality raw token → canonical label (reverse of MODALITY_VOCAB). Tokens
 # with no approved mapping are preserved lowercase (e.g. OpenNeuro's "beh").
@@ -268,6 +308,279 @@ def build_source_record(node: dict) -> dict:
     return source
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DANDI catalog normalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _as_str(value) -> str | None:
+    """Best-effort string cast (strings pass through; datetimes/ints stringify)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    try:
+        return str(value).strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    """Best-effort ISO8601 → naive-UTC datetime (mirrors _parse_iso)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _dandi_id(identifier) -> str | None:
+    """Normalize a DANDI dandiset identifier ('DANDI:000003' or '000003') → '000003'."""
+    raw = _as_str(identifier)
+    if not raw:
+        return None
+    return raw.replace("DANDI:", "").strip() or None
+
+
+def _dandi_modality(approach: list | None, measurement_technique: list | None) -> list[str]:
+    """Derive canonical modalities deterministically from DANDI approach[] +
+    measurementTechnique[] name tokens. Empty when nothing maps (never guessed)."""
+    names: set[str] = set()
+    for group in (approach, measurement_technique):
+        for item in group or []:
+            if isinstance(item, dict) and item.get("name"):
+                names.add(str(item["name"]).strip().lower())
+    out: list[str] = []
+    for label, tokens in DANDI_MODALITY_RULES:
+        if any(tok in names for tok in tokens):
+            out.append(label)
+    return out
+
+
+def _dandi_species(entries: list | None) -> list[str] | None:
+    """Map DANDI assetsSummary.species[] to canonical species values.
+
+    Prefers the taxonomy identifier when present (e.g. ``NCBITaxon_10090``) so
+    equivalent display names ("House mouse" vs "Mus musculus - House mouse")
+    collapse to ONE canonical identity. Falls back to the display name.
+    """
+    out: list[str] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        identifier = _as_str(e.get("identifier"))
+        name = _as_str(e.get("name"))
+        if identifier:
+            taxon = identifier.rstrip("/").split("/")[-1].strip()
+            if taxon and taxon not in out:
+                out.append(taxon)
+        elif name and name not in out:
+            out.append(name)
+    return out or None
+
+
+def _dandi_about_names(about: list | None, schema_key: str) -> list[str] | None:
+    """Names from about[] entries with the given schemaKey (Anatomy / Disorder).
+
+    Only exact schemaKey matches count — never inferred from title/description.
+    """
+    out: list[str] = []
+    for item in about or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("schemaKey") or "") != schema_key:
+            continue
+        name = _as_str(item.get("name"))
+        if name and name not in out:
+            out.append(name)
+    return out or None
+
+
+def _dandi_contributors(contributor: list | None) -> tuple[list[str], list[dict]]:
+    """Split DANDI contributor[] into (authors, contributors).
+
+    ``dcite:Author`` role → authors[] (never funders); every other role stays
+    in contributors[] with its roleName preserved.
+    """
+    authors: list[str] = []
+    contributors: list[dict] = []
+    for c in contributor or []:
+        if not isinstance(c, dict):
+            continue
+        name = _as_str(c.get("name"))
+        if not name:
+            continue
+        roles = c.get("roleName") or []
+        role_names = [str(r) for r in roles] if isinstance(roles, list) else [str(roles)]
+        entry = {
+            "name": name,
+            "roleName": role_names,
+            "includeInCitation": c.get("includeInCitation"),
+            "identifier": _as_str(c.get("identifier")),
+        }
+        if any("dcite:Author" in r for r in role_names):
+            if name not in authors:
+                authors.append(name)
+        else:
+            contributors.append(entry)
+    return authors, contributors
+
+
+def _dandi_access_status(version: dict) -> str | None:
+    """DANDI access[].status 'dandi:OpenAccess' → 'open' (deterministic)."""
+    for a in version.get("access") or []:
+        if isinstance(a, dict) and (a.get("status") or "").endswith("OpenAccess"):
+            return "open"
+    return None
+
+
+def build_dandi_source_record(version: dict, published: dict | None = None) -> dict:
+    """Map a full DANDI draft VERSION response → per-source canonical record.
+
+    ``published`` (optional) is the list endpoint's ``most_recent_published_version``
+    dict and is used ONLY for provenance (version id / published DOI). The DANDI
+    version DOI is deliberately NOT stored as the canonical ``doi`` — it is
+    per-version, the draft DOI is a placeholder, and it must never drive
+    canonical identity resolution.
+    """
+    ds_id = _dandi_id(version.get("identifier")) or _dandi_id(version.get("id"))
+    assets_summary = version.get("assetsSummary") or {}
+    approach = assets_summary.get("approach") or []
+    techniques = assets_summary.get("measurementTechnique") or []
+    about = version.get("about") or []
+    access = version.get("access") or []
+    contributor = version.get("contributor") or []
+
+    license_values = _str_list(version.get("license"))
+    license_raw = license_values[0] if license_values else None
+    availability = _dandi_access_status(version)
+    species_entries = assets_summary.get("species") or []
+    authors, contributors = _dandi_contributors(contributor)
+
+    size_bytes = assets_summary.get("numberOfBytes")
+    try:
+        size_bytes = int(size_bytes) if size_bytes is not None else None
+    except (TypeError, ValueError):
+        size_bytes = None
+    participant_count = assets_summary.get("numberOfSubjects")
+
+    date_created = _as_str(version.get("dateCreated"))
+    date_modified = _as_str(version.get("dateModified"))
+    date_published = _as_str(version.get("datePublished"))
+    source_url = _as_str(version.get("url"))
+
+    published = published or {}
+    published_doi = _as_str(published.get("doi"))
+
+    # ── Derived NeuroSearch fields (documented deterministic rules) ─────────
+    # publicationYear comes ONLY from a real datePublished — never dateCreated.
+    derived = {
+        "participantCount": participant_count if isinstance(participant_count, int) else None,
+        "ageGroup": None,
+        "sizeLabel": size_label(size_bytes),
+        "publicationYear": derive_publication_year(date_published),
+        "availability": availability,
+    }
+
+    modality_raw = [
+        str(x.get("name"))
+        for x in (approach + techniques)
+        if isinstance(x, dict) and x.get("name")
+    ]
+
+    source = {
+        # provenance / identity
+        "repository": DANDI_REPOSITORY,
+        "sourceDatasetId": ds_id,
+        "sourceUrl": source_url,
+        "doi": None,  # DANDI version DOI is never the canonical/global identity
+        # core
+        "title": _as_str(version.get("name")),
+        "description": _as_str(version.get("description")),
+        "readme": None,
+        "license": license_raw,             # raw — never destroyed
+        "licenseNormalized": normalize_license(license_raw),
+        "datasetType": None,                # dataStandard is NOT datasetType
+        "availability": availability,
+        "lastUpdated": _parse_timestamp(date_modified),  # real update stamp only
+        "createdAt": _parse_timestamp(date_created),
+        "publishDate": date_published,
+        "authors": authors,
+        "contributors": contributors,
+        # scientific metadata
+        "modality": _dandi_modality(approach, techniques),
+        "modalityRaw": modality_raw,
+        "species": _dandi_species(species_entries),
+        "speciesRaw": species_entries,
+        "disease": _dandi_about_names(about, "Disorder"),
+        "brainRegions": _dandi_about_names(about, "Anatomy"),
+        "ages": None,                       # Phase 1: no asset-level age extraction
+        "ageGroup": None,
+        "participantCount": derived["participantCount"],
+        "subjectIds": None,
+        # Phase 1 unavailable fields stay null/empty (never invented).
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],                    # wasGeneratedBy is NOT experimental sessions
+        "trialCount": None,
+        "keywords": _str_list(version.get("keywords")),
+        "analysisMethods": None,
+        # preserved DANDI structures (also kept verbatim in rawMetadata)
+        "variableMeasured": assets_summary.get("variableMeasured") or [],
+        "dataStandard": assets_summary.get("dataStandard") or [],
+        "relatedResource": version.get("relatedResource") or [],
+        "accessRaw": access,
+        # snapshot / version information
+        "snapshot": {
+            "latestTag": _as_str(version.get("version")),
+            "version": _as_str(version.get("version")),
+            "versionIdentifier": _as_str(version.get("identifier")),
+            "dateCreated": date_created,
+            "dateModified": date_modified,
+            "datePublished": date_published,
+            "assetCount": version.get("assetCount"),
+            "totalFiles": assets_summary.get("numberOfFiles"),
+            "publishedVersion": {
+                k: published.get(k)
+                for k in ("version", "name", "created", "modified", "status", "size", "doi")
+                if published.get(k) is not None
+            },
+            "publishedDoi": published_doi,
+        },
+        "datasetSizeBytes": size_bytes,
+        # publication information
+        "publication": {
+            "publishDate": date_published,
+            "citation": _as_str(version.get("citation")),
+            "relatedResource": version.get("relatedResource") or [],
+            "publishedDoi": published_doi,
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": DANDI_REPOSITORY,
+            "sourceApi": "dandiarchive.org",
+            "retrievedAt": _utcnow(),
+            "direct": [
+                "title", "description", "keywords", "species", "license",
+                "access", "about", "relatedResource", "variableMeasured",
+            ],
+            "derived": ["participantCount", "sizeLabel", "publicationYear", "availability", "modality"],
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched full DANDI version response — preserved verbatim (spec §11)
+        "rawMetadata": version,
+    }
+    return source
+
+
 def canonical_record_from_source(source: dict) -> dict:
     """Wrap a single per-source record into a new canonical record.
 
@@ -306,7 +619,7 @@ def canonical_record_from_source(source: dict) -> dict:
         "longitudinal": source.get("studyLongitudinal"),
         "tasks": list(source.get("tasks") or []),
         "sessions": list(source.get("sessions") or []),
-        "keywords": [],
+        "keywords": list(source.get("keywords") or []),
         "analysisMethods": None,
         "datasetType": source.get("datasetType"),
         "availability": source.get("availability"),
@@ -316,7 +629,7 @@ def canonical_record_from_source(source: dict) -> dict:
         "createdAt": source.get("createdAt"),
         "snapshot": source.get("snapshot"),
         "sources": [_source_slim(source)],
-        "rawMetadata": {REPOSITORY: source.get("rawMetadata")},
+        "rawMetadata": {source.get("repository") or REPOSITORY: source.get("rawMetadata")},
         "sourceKeys": [f"{source.get('repository')}:{source.get('sourceDatasetId')}"],
         "provenance": {
             "identity": {
