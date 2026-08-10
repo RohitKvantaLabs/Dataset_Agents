@@ -29,7 +29,11 @@ from datetime import datetime, timezone
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.catalog.normalize import build_dandi_source_record, build_source_record
+from app.catalog.normalize import (
+    build_dandi_source_record,
+    build_nemar_source_record,
+    build_source_record,
+)
 from app.catalog.persistence import get_collection, upsert_canonical
 from app.catalog.schema import CATALOG_COLLECTION
 
@@ -37,6 +41,9 @@ logger = logging.getLogger("neuro_platform.catalog.ingest")
 
 # DANDI Archive public REST API.
 DANDI_API_BASE = "https://api.dandiarchive.org/api"
+
+# NEMAR backend API (investigation 2026-08-10 — live v0.9.7).
+NEMAR_API_BASE = "https://api.nemar.org"
 
 GRAPHQL_URL = "https://openneuro.org/crn/graphql"
 
@@ -592,6 +599,266 @@ async def run_dandi_ingestion(
     stats["finished_at"] = _utcnow()
     log(
         f"[dandi] done: discovered={stats['discovered']} retrieved={stats['retrieved']} "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEMAR Phase-1 ingestion
+#
+# Flow (investigation + compatibility verdict, 2026-08-10):
+#     enumerate api.nemar.org/datasets?limit=200&offset=<n>  (offset/limit ONLY;
+#     the ``page`` param is a no-op on this API; limit is capped at 200)
+#     → per-dataset detail api.nemar.org/datasets/{id}
+#     → normalization → identity resolution → insert/merge
+#
+# Identity: OpenNeuro mirrors (source='openneuro', source_id='ds…') resolve to
+# the EXISTING OpenNeuro canonical record via the generic cross-reference
+# mechanism (synthesized openneuro.org/datasets/<id> URL → extract_cross_
+# references → sourceKeys match). NEMAR-native (nm…, no source_id) become new
+# canonical candidates keyed by their concept DOI.
+#
+# Phase 1 performs ZERO asset-level calls (asset_calls stays 0): the detail
+# endpoint is sufficient for all canonical fields.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEMAR_LIST_PAGE_SIZE = 200  # server caps limit at 200 (verified live)
+
+
+def make_nemar_fetchers(retry_counter: list[int]):
+    """Build retry-wrapped NEMAR fetchers.
+
+    ``retry_counter`` is appended to on every actual retry attempt so the
+    report can distinguish real retries from hard failures.
+    """
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=lambda retry_state: retry_counter.append(1),
+    )
+    async def fetch_list_page(client: httpx.AsyncClient, offset: int, page_size: int) -> dict:
+        """One ``/datasets?limit=&offset=`` page (rich list records)."""
+        resp = await client.get(
+            f"{NEMAR_API_BASE}/datasets?limit={page_size}&offset={offset}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=lambda retry_state: retry_counter.append(1),
+    )
+    async def fetch_detail(client: httpx.AsyncClient, ds_id: str) -> dict:
+        """GET /datasets/{id} — the single Phase-1 metadata source."""
+        resp = await client.get(f"{NEMAR_API_BASE}/datasets/{ds_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    return fetch_list_page, fetch_detail
+
+
+async def run_nemar_ingestion(
+    db,
+    *,
+    target: int | None = None,
+    page_size: int = NEMAR_LIST_PAGE_SIZE,
+    page_delay: float = 0.15,
+    ids: list[str] | None = None,
+    client: httpx.AsyncClient | None = None,
+    log=print,
+) -> dict:
+    """Ingest public NEMAR datasets into the canonical catalog (Phase 1).
+
+    - Enumerates via ``/datasets?limit=<page_size>&offset=<n>`` (offset/limit;
+      never ``page``). Stops when ``total_count`` is reached or a page returns
+      no records.
+    - ``ids`` (optional) restricts processing to the given dataset IDs — used
+      by the smoke-test runner to force a representative sample; when None all
+      discovered datasets are processed.
+    - ``target`` caps the number of records processed (retrieved).
+    - NEVER calls version/summary/manifest/records/file endpoints; ``asset_calls``
+      stays 0.
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "nemar",
+        "discovered": 0,
+        "retrieved": 0,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_failures": 0,
+        "api_error_details": [],
+        "retries": 0,
+        "pages": 0,
+        "list_requests": 0,
+        "detail_requests": 0,
+        "asset_calls": 0,          # Phase 1 never touches data-plane files
+        "total_api_calls": 0,
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+        "target": target,
+    }
+
+    t0 = time.monotonic()
+    retry_counter: list[int] = []
+    fetch_list_page, fetch_detail = make_nemar_fetchers(retry_counter)
+    owns_client = client is None
+    async with (client or httpx.AsyncClient(timeout=60)) as c:
+        # ── 1) Enumerate dataset IDs (offset/limit). ────────────────────────
+        list_records: dict[str, dict] = {}
+        discovered_ids: list[str] = []
+        if ids:
+            discovered_ids = list(ids)
+        else:
+            offset = 0
+            consecutive_failures = 0
+            while True:
+                if target is not None and len(discovered_ids) >= target:
+                    break
+                stats["pages"] += 1
+                stats["list_requests"] = stats["pages"]
+                try:
+                    data = await fetch_list_page(c, offset, page_size)
+                    consecutive_failures = 0
+                except Exception as exc:  # noqa: BLE001 — page-level failure
+                    stats["api_failures"] += 1
+                    stats["api_error_details"].append(
+                        f"list page {stats['pages']} (offset {offset}): {type(exc).__name__}: {exc}"
+                    )
+                    log(f"[nemar] list page {stats['pages']} failed: {type(exc).__name__}: {exc}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        log("[nemar] too many consecutive list failures — aborting enumeration")
+                        break
+                    await asyncio.sleep(page_delay * 2)
+                    continue
+                stats["retries"] = len(retry_counter)
+                recs = data.get("datasets") or []
+                # Defensive: only stop early when total_count is actually
+                # present; a missing count must never truncate enumeration.
+                total_count = data.get("total_count")
+                for rec in recs:
+                    ds_id = str(rec.get("dataset_id") or rec.get("id") or "").strip()
+                    if not ds_id:
+                        continue
+                    list_records[ds_id] = rec
+                    if ds_id not in discovered_ids:
+                        discovered_ids.append(ds_id)
+                    if target is not None and len(discovered_ids) >= target:
+                        break
+                stats["discovered"] = len(discovered_ids)
+                log(
+                    f"[nemar] page {stats['pages']}: offset={offset} records={len(recs)} "
+                    f"total={total_count} discovered={len(discovered_ids)}"
+                )
+                if not recs:
+                    break
+                if total_count is not None and offset + len(recs) >= total_count:
+                    break
+                offset += len(recs)
+                await asyncio.sleep(page_delay)
+
+        # ``ids``-driven runs never enumerated, so discovered reflects the
+        # explicit id set (keeps smoke-test reports truthful).
+        stats["discovered"] = len(discovered_ids)
+
+        # ── 2) Fetch + normalize + validate + dedup + persist. ──────────────
+        for ds_id in discovered_ids:
+            if target is not None and stats["retrieved"] >= target:
+                break
+            stats["detail_requests"] += 1
+            try:
+                payload = await fetch_detail(c, ds_id)
+            except Exception as exc:  # noqa: BLE001
+                stats["api_failures"] += 1
+                stats["failure_details"].append(
+                    f"{ds_id}: fetch_detail: {type(exc).__name__}: {exc}"
+                )
+                log(f"[nemar] detail fetch failed for {ds_id}: {type(exc).__name__}: {exc}")
+                continue
+            stats["retrieved"] += 1
+            stats["retries"] = len(retry_counter)
+
+            detail = payload.get("dataset") or {}
+            try:
+                source = build_nemar_source_record(detail, list_records.get(ds_id))
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{ds_id}: normalize: {exc}")
+                continue
+            stats["normalized"] += 1
+
+            errs = _validate_source(source)
+            if errs:
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(f"{ds_id}: {errs[0]}")
+                log(f"[nemar] validation failed for {ds_id}: {errs}")
+                continue
+            stats["validated_ok"] += 1
+
+            try:
+                result = await upsert_canonical(collection, source)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{ds_id}: upsert: {exc}")
+                log(f"[nemar] upsert failed for {ds_id}: {exc}")
+                continue
+
+            if result.get("action") == "invalid":
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(
+                    f"{ds_id}: {result.get('errors', [])[:2]}"
+                )
+                log(f"[nemar] canonical validation failed for {ds_id}")
+                continue
+
+            if result["action"] == "inserted":
+                stats["inserted"] += 1
+            else:
+                stats["merged"] += 1
+                via = result.get("matchedVia") or "unknown"
+                stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+            ambiguous = result.get("ambiguousCandidates") or []
+            if ambiguous:
+                stats["ambiguous_candidates"] += len(ambiguous)
+                if len(stats["ambiguous_sample"]) < 10:
+                    stats["ambiguous_sample"].append(
+                        {
+                            "source": f"nemar:{ds_id}",
+                            "candidates": [
+                                cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                            ],
+                        }
+                    )
+
+            await asyncio.sleep(page_delay)  # rate limit — do not hammer NEMAR
+
+    stats["asset_calls"] = 0  # hard guarantee: no asset/file crawling
+    stats["total_api_calls"] = stats["list_requests"] + stats["detail_requests"]
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[nemar] done: discovered={stats['discovered']} retrieved={stats['retrieved']} "
         f"normalized={stats['normalized']} inserted={stats['inserted']} "
         f"merged={stats['merged']} failed={stats['failed']} "
         f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "

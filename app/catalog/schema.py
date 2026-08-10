@@ -59,6 +59,7 @@ KNOWN_NORMALIZED_LICENSES: frozenset[str] = frozenset(
 AVAILABILITY_BY_REPOSITORY: dict[str, str] = {
     "openneuro": "open",
     "dandi": "open",
+    "nemar": "open",  # NEMAR public datasets are always open access
     "neurovault": "open",
     "zenodo": "open",
     "figshare": "open",

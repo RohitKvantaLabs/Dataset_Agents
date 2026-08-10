@@ -18,6 +18,7 @@ Never fabricate: a missing value is None/[] — never guessed, never LLM.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 
@@ -577,6 +578,293 @@ def build_dandi_source_record(version: dict, published: dict | None = None) -> d
         "derived": derived,
         # untouched full DANDI version response — preserved verbatim (spec §11)
         "rawMetadata": version,
+    }
+    return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEMAR catalog normalization (Phase 1 — investigation 2026-08-10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEMAR_REPOSITORY = "nemar"
+
+# Canonical human dataset page (verified live: https://nemar.org/dataset/<id>).
+# The legacy dataexplorer URL redirects here. The path form is REQUIRED for
+# identity: ``normalize_url_key()`` strips query params, so a query-param URL
+# would collapse every NEMAR dataset to one normalized identity key.
+NEMAR_DATASET_PAGE = "https://nemar.org/dataset/"
+
+# Pattern for OpenNeuro versioned DOIs inside related_identifiers (provenance).
+_OPENNEURO_DOI_RE = re.compile(r"10\.18112/openneuro\.ds\d{4,6}\.v[0-9.]+", re.IGNORECASE)
+
+
+def _parse_enrichment(raw: str | None) -> dict:
+    """Best-effort parse of ``enrichment_json`` (a JSON string)."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:  # noqa: BLE001 — malformed enrichment is never fatal
+        return {}
+
+
+def _nemar_timestamp(value: str | None) -> datetime | None:
+    """Parse NEMAR timestamps (``'2026-01-19 03:25:23'``, no tz) → naive UTC."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace(" ", "T").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _split_tasks(raw: str | list | None) -> list[str]:
+    """Defensive NEMAR task parsing.
+
+    The API exposes tasks as a comma-joined STRING (e.g.
+    ``"P300,eyesClosed,eyesOpen"``). Split on commas, strip, drop empties,
+    preserve order and original labels (BIDS task labels are never collapsed).
+    Embedded comma-runs (e.g. "DespicableMe,DiaryOfAWimpyKid,…") are split the
+    same way. Garbage values ("", "1", "unnamed") are preserved verbatim.
+    """
+    values: list[str] = []
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, list):
+        values = [v for v in raw if isinstance(v, str)]
+    out: list[str] = []
+    for v in values:
+        for part in v.split(","):
+            t = part.strip()
+            if t and t not in out:
+                out.append(t)
+    return out
+
+
+def _nemar_authors(detail: dict, enrichment: dict) -> tuple[list[str], list[dict]]:
+    """Extract (authors, contributors) from the NEMAR detail payload.
+
+    Prefers the structured ``enrichment_json.authors`` (dict name →
+    {orcid, affiliations} or list of {name, …}); falls back to the plain
+    comma-separated ``authors`` string on the detail.
+    """
+    enr_authors = enrichment.get("authors")
+    names: list[str] = []
+    contributors: list[dict] = []
+    if isinstance(enr_authors, dict):
+        for name, info in enr_authors.items():
+            if not isinstance(name, str) or not name.strip():
+                continue
+            names.append(name.strip())
+            if isinstance(info, dict) and (info.get("orcid") or info.get("affiliations")):
+                contributors.append(
+                    {
+                        "name": name.strip(),
+                        "orcid": info.get("orcid"),
+                        "affiliations": [
+                            a.get("name") for a in (info.get("affiliations") or []) if isinstance(a, dict)
+                        ],
+                    }
+                )
+    elif isinstance(enr_authors, list):
+        for a in enr_authors:
+            if isinstance(a, dict) and a.get("name"):
+                names.append(str(a["name"]).strip())
+    if not names and isinstance(detail.get("authors"), str):
+        names = [n.strip() for n in detail["authors"].split(",") if n.strip()]
+    return names, contributors
+
+
+def _nemar_keywords(enrichment: dict) -> list[str]:
+    """NEMAR keywords are objects ``[{term: …}]`` (some are plain strings)."""
+    out: list[str] = []
+    for k in enrichment.get("keywords") or []:
+        if isinstance(k, dict):
+            t = k.get("term")
+        elif isinstance(k, str):
+            t = k
+        else:
+            continue
+        if isinstance(t, str) and t.strip() and t.strip() not in out:
+            out.append(t.strip())
+    return out
+
+
+def _nemar_openneuro_doi(enrichment: dict) -> str | None:
+    """First OpenNeuro versioned DOI in related_identifiers (provenance only)."""
+    for r in enrichment.get("related_identifiers") or []:
+        if not isinstance(r, dict):
+            continue
+        identifier = str(r.get("identifier") or "")
+        if _OPENNEURO_DOI_RE.search(identifier):
+            return normalize_doi(identifier)
+    return None
+
+
+def build_nemar_source_record(detail: dict, list_record: dict | None = None) -> dict:
+    """Map a NEMAR API detail payload (``dataset`` object) → per-source record.
+
+    Identity rules (verified against the real catalog in the compatibility
+    verdict):
+    - OpenNeuro mirrors (``source='openneuro'`` + ``source_id='ds…'``) get
+      ``doi = None`` (never the NEMAR DOI — the DOI-conflict rule would block
+      the merge; never the versioned OpenNeuro DOI as identity — version drift
+      would split the dataset). Resolution happens via the generic
+      cross-reference mechanism: the synthesized ``openneuro.org/datasets/…``
+      URL in ``publication.referencesAndLinks`` is parsed by
+      ``extract_cross_references()`` into ``openneuro:ds…``.
+    - NEMAR-native (``nm…``, no source_id) use the NEMAR concept DOI as their
+      canonical identity (existing identity priority: DOI > URL > repo:id).
+    - age_min/age_max stay on the SOURCE record only — canonical ``ages`` /
+      ``ageGroup`` stay null (a min/max range is never treated as subject ages).
+    """
+    ds_id = str(detail.get("dataset_id") or detail.get("id") or "").strip()
+    enrichment = _parse_enrichment(detail.get("enrichment_json"))
+
+    # Provenance / identity
+    source_repo = detail.get("source") or (list_record or {}).get("source")
+    source_id = detail.get("source_id") or (list_record or {}).get("source_id")
+    is_mirror = bool(source_repo == "openneuro" and source_id)
+    url = f"{NEMAR_DATASET_PAGE}{ds_id}"
+
+    # DOI: mirrors → None (identity comes from the OpenNeuro source_id
+    # cross-reference); natives → NEMAR concept DOI (concept, NEVER version).
+    if is_mirror:
+        doi = None
+    else:
+        doi = normalize_doi(detail.get("concept_doi"))
+    openneuro_doi = _nemar_openneuro_doi(enrichment) if is_mirror else None
+
+    # Modality: BIDS-datatype tokens pass through normalize_modalities()
+    # unchanged (eeg/meg/ieeg/emg/nirs/motion/beh/anat/func/dwi/fmap/perf).
+    modality_raw = _split_tasks(detail.get("modalities"))
+    modality = normalize_modalities(modality_raw)
+
+    participants = detail.get("participants")
+    if participants is None:
+        participants = detail.get("subject_count")
+    try:
+        participants = int(participants) if participants is not None else None
+    except (TypeError, ValueError):
+        participants = None
+
+    size_bytes = detail.get("file_size")
+    try:
+        size_bytes = int(size_bytes) if size_bytes is not None else None
+    except (TypeError, ValueError):
+        size_bytes = None
+
+    authors, contributors = _nemar_authors(detail, enrichment)
+    publish_date = _as_str(detail.get("publish_date"))
+
+    derived = {
+        "participantCount": participants,
+        "ageGroup": None,                       # never derived from min/max range
+        "sizeLabel": size_label(size_bytes),
+        "publicationYear": derive_publication_year(publish_date),
+        "availability": availability_for(
+            NEMAR_REPOSITORY,
+            detail.get("visibility") == "public" and detail.get("status") == "active",
+        ),
+    }
+
+    license_raw = _as_str(detail.get("license")) or _as_str(enrichment.get("license"))
+    dataset_type = _as_str(enrichment.get("dataset_type"))
+    version = _as_str(detail.get("latest_version"))
+    version_doi = _as_str(detail.get("latest_version_doi"))
+
+    # Cross-reference for mirrors — drives the existing generic
+    # ``cross_reference`` identity path (extract_cross_references parses
+    # ``openneuro.org/datasets/<id>``). Never a NEMAR-only dedup rule.
+    references = [f"https://openneuro.org/datasets/{source_id}"] if is_mirror else []
+
+    source = {
+        # provenance / identity
+        "repository": NEMAR_REPOSITORY,
+        "sourceDatasetId": ds_id,
+        "sourceUrl": url,
+        "doi": doi,
+        # core
+        "title": _as_str(detail.get("name")) or _as_str(enrichment.get("title")),
+        "description": _as_str(detail.get("description")) or _as_str(enrichment.get("description")),
+        "readme": _as_str(detail.get("readme")),
+        "license": license_raw,                 # raw — never destroyed
+        "licenseNormalized": normalize_license(license_raw),
+        "datasetType": dataset_type,
+        "availability": derived["availability"],
+        "lastUpdated": _nemar_timestamp(detail.get("updated_at")),
+        "createdAt": _nemar_timestamp(detail.get("created_at")),
+        "publishDate": publish_date,
+        "authors": authors,
+        "contributors": contributors,
+        # scientific metadata
+        "modality": modality,
+        "modalityRaw": modality_raw,
+        "species": None,                        # NEMAR: no structured species
+        "speciesRaw": None,
+        "disease": None,                        # free text only (description/readme/keywords)
+        "brainRegions": None,
+        "ages": None,                           # age range is NOT subject ages
+        "ageGroup": None,
+        "ageMin": detail.get("age_min"),       # dataset-level range — source only
+        "ageMax": detail.get("age_max"),
+        "participantCount": participants,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": _split_tasks(detail.get("tasks")),
+        "sessions": [],                         # NEMAR exposes a count, not labels
+        "trialCount": None,
+        "keywords": _nemar_keywords(enrichment),
+        "analysisMethods": None,
+        # snapshot / version information (NEMAR versions are NEMAR-side;
+        # latest version only — never one canonical dataset per version)
+        "snapshot": {
+            "latestTag": version,
+            "versionDoi": version_doi,
+            "totalFiles": detail.get("total_files"),
+            "bidsVersion": _as_str(detail.get("bids_version")),
+            "sessionsCount": detail.get("sessions_count"),
+            "nChannels": detail.get("n_channels"),
+            "electrodeSystem": _as_str(detail.get("electrode_system")),
+            "hasHed": detail.get("has_hed"),
+            "hedVersion": _as_str(detail.get("hed_version")),
+            "githubRepo": _as_str(detail.get("github_repo")),
+            "resourceTypeSpecific": _as_str(enrichment.get("resource_type_specific")),
+            "openNeuroSourceId": source_id if is_mirror else None,
+            "openNeuroDoi": openneuro_doi,      # provenance only — never identity
+        },
+        "datasetSizeBytes": size_bytes,
+        # publication information
+        "publication": {
+            "publishDate": publish_date,
+            "citations": detail.get("num_citations"),
+            "numDatasetCitations": detail.get("num_dataset_citations"),
+            "numDatapaperCitations": detail.get("num_datapaper_citations"),
+            "funding": enrichment.get("funding_references") or [],
+            "relatedIdentifiers": enrichment.get("related_identifiers") or [],
+            "referencesAndLinks": references,
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": NEMAR_REPOSITORY,
+            "sourceApi": "api.nemar.org",
+            "retrievedAt": _utcnow(),
+            "direct": ["title", "description", "modality", "license", "authors", "tasks", "keywords"],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched full NEMAR API detail payload — preserved verbatim (spec §11)
+        "rawMetadata": detail,
     }
     return source
 
