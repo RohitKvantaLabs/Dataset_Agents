@@ -61,6 +61,8 @@ AVAILABILITY_BY_REPOSITORY: dict[str, str] = {
     "dandi": "open",
     "nemar": "open",  # NEMAR public datasets are always open access
     "neuromorpho": "open",  # NeuroMorpho reconstructions are always open access
+    "allen": "open",  # Allen Brain Atlas products are publicly accessible metadata
+    "hcp": "open",  # HCP/CCF study pages are publicly accessible metadata
     "neurovault": "open",
     "zenodo": "open",
     "figshare": "open",

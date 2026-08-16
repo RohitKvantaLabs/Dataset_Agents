@@ -49,7 +49,7 @@ SPECIES_VOCAB: dict[str, list[str]] = {
     ],
     "mouse": ["mouse", "mice", "murine"],
     "rat": ["rat", "rats"],
-    "macaque": ["macaque", "macaques", "rhesus", "monkey", "monkeys", "primate", "primates"],
+    "macaque": ["macaque", "macaques", "rhesus", "monkey", "monkeys", "primate", "primates", "nhp", "non-human primate", "nonhuman primate"],  # nhp = Allen Brain Atlas abbreviation for non-human primate
     "zebrafish": ["zebrafish", "danio rerio"],
     "drosophila": ["drosophila", "fruit fly", "fruit flies"],
     "c.elegans": ["c. elegans", "caenorhabditis elegans"],

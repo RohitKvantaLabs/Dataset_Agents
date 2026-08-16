@@ -22,6 +22,8 @@ import json
 import re
 from datetime import datetime, timezone
 
+from html import unescape as _html_unescape
+
 from app.catalog.schema import (
     availability_for,
     derive_age_groups,
@@ -1305,6 +1307,631 @@ def build_neuromorpho_source_record(group: dict) -> dict:
             "strains": group.get("strains"),
             "ageMin": age_min,
             "ageMax": age_max,
+        },
+    }
+    return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Allen Brain Atlas catalog normalization (Phase 1 — implementation 2026-08-16)
+#
+# Dataset unit = ONE Allen Product (locked decision from the investigation).
+# 64 unique Products exist in the live RMA API (verified: total_rows=64).
+# Lower-level entities (170,036 SectionDataSets, 6,703 MicroarrayDataSets,
+# 22 AtlasDataSets, SectionImages, Specimens, Donors) are child/content
+# entities and are NEVER ingested as canonical datasets — only their
+# aggregated statistics are preserved.
+#
+# Identity:
+#   sourceDatasetId = "allen:<productId>"  (deterministic, locked decision)
+#   sourceKeys      = ["allen:allen:<productId>"]
+#   DOI             = None (Allen Products carry no reliable dataset-level
+#                     DOI; publication DOIs are never used as dataset identity)
+#   sourceUrl       = deterministic per-product resource URL. The RMA query
+#                     URL (https://api.brain-map.org/api/v2/data/query.json?
+#                     criteria=model::Product[id$eqN]) is the live locator but
+#                     is query-based: normalize_url_key() strips the query,
+#                     collapsing every product to ONE normalized URL — the
+#                     NeuroMorpho shared-URL trap that merged 27 contributions.
+#                     The stored sourceUrl therefore uses the documented RMA
+#                     per-record resource path (model/id/query.json) so each
+#                     product keeps a distinct sourceUrlNorm; the working
+#                     criteria URL is preserved under rawMetadata.allen.apiUrl.
+#
+# Canonical field mapping (never inferred from free text):
+#   title         = product name
+#   description   = product description
+#   species       = product species (Mouse/Human/NHP → canonical labels)
+#   brainRegions  = None (no structured anatomy on Product; never inferred)
+#   modality      = []    (no explicit Allen modality; nothing invented)
+#   ages/ageGroup = None  (donor ages are species-specific units — never fed
+#                     into derive_age_groups(); preserved as summaries)
+#   sex           = donor sex distribution (snapshot.genders, explicit only)
+#   doi/license   = None  (no reliable dataset-level values)
+#
+# Child statistics (from the include response; arrays NEVER stored):
+#   dataSetCount / specimenCount / donorCount are exact. Per-type counts
+#   (sectionDataSetCount / microarrayDataSetCount / atlasDataSetCount) are
+#   NOT supported by the RMA (no type discriminator on included DataSet rows,
+#   no product filter on the type models) and stay null; the repo-global
+#   verified totals are recorded by the ingestion report.
+#
+# ZERO asset/file crawling — metadata only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLEN_REPOSITORY = "allen"
+
+# RMA per-record resource URL (documented convention, deterministic path).
+ALLEN_PRODUCT_URL = "https://api.brain-map.org/api/v2/data/Product/{product_id}/query.json"
+
+# The working RMA criteria URL — preserved verbatim under rawMetadata.allen.apiUrl.
+ALLEN_PRODUCT_CRITERIA_URL = (
+    "https://api.brain-map.org/api/v2/data/query.json?criteria=model::Product[id$eq{product_id}]"
+)
+
+# Donor sex values that are NOT explicit subject metadata (never preserved).
+_ALLEN_UNKNOWN_SEX = frozenset({"unknown", "not reported", "unspecified", ""})
+_ALLEN_UNKNOWN_STRAIN = frozenset({"unknown", "not reported", "unspecified", "", "none"})
+
+
+def _allen_strip_product(product: dict) -> dict:
+    """Product-level payload WITHOUT the child arrays (never stored)."""
+    return {
+        k: product.get(k)
+        for k in ("id", "name", "abbreviation", "description", "resource", "species", "tags")
+    }
+
+
+def allen_child_stats(product: dict) -> dict:
+    """Aggregated child/entity statistics from the include payload.
+
+    Pure function of the product dict returned by the RMA include request
+    (``data_sets`` / ``specimens`` / ``donors`` arrays present or absent).
+    Never returns the child rows themselves — only counts and bounded
+    distributions.
+
+    Returns:
+        dataSetCount, specimenCount, donorCount (exact),
+        sectionDataSetCount / microarrayDataSetCount / atlasDataSetCount
+        (null — type discrimination unsupported), plus donor sex / strain /
+        age-id distributions and condition descriptions (explicit values only).
+    """
+    data_sets = product.get("data_sets") or []
+    specimens = product.get("specimens") or []
+    donors = product.get("donors") or []
+
+    sexes: list[str] = []
+    strains: list[str] = []
+    age_ids: list[int] = []
+    conditions: list[str] = []
+    for d in donors:
+        if not isinstance(d, dict):
+            continue
+        sex = str(d.get("sex_full_name") or d.get("sex") or "").strip()
+        if sex and sex.lower() not in _ALLEN_UNKNOWN_SEX and sex not in sexes:
+            sexes.append(sex)
+        strain = str(d.get("strain") or "").strip()
+        if strain and strain.lower() not in _ALLEN_UNKNOWN_STRAIN and strain not in strains:
+            strains.append(strain)
+        age_id = d.get("age_id")
+        if age_id is not None:
+            try:
+                age_id = int(age_id)
+            except (TypeError, ValueError):
+                age_id = None
+            if age_id is not None and age_id not in age_ids:
+                age_ids.append(age_id)
+        condition = str(d.get("condition_description") or "").strip()
+        if condition and condition.lower() not in _ALLEN_UNKNOWN_STRAIN and condition not in conditions:
+            conditions.append(condition)
+
+    return {
+        "dataSetCount": len(data_sets),
+        "sectionDataSetCount": None,  # type discrimination unsupported by RMA
+        "microarrayDataSetCount": None,
+        "atlasDataSetCount": None,
+        "specimenCount": len(specimens),
+        "donorCount": len(donors),
+        "donorSexes": sorted(sexes),
+        "donorStrains": sorted(strains),
+        "donorAgeIds": sorted(age_ids),
+        "donorConditions": sorted(conditions),
+    }
+
+
+def _allen_age_summaries(age_ids: list[int], age_map: dict | None) -> list[dict]:
+    """Resolve donor age ids against the Age model map (pure).
+
+    ``age_map`` maps age_id → {id, name, days, age_group_id, embryonic,
+    organism_id} (fetched once by the ingestion). Returns bounded summaries;
+    unknown ids are preserved as ``{ageId: N}`` without fabrication.
+    """
+    out: list[dict] = []
+    for age_id in age_ids:
+        row = (age_map or {}).get(age_id) if isinstance(age_map, dict) else None
+        if row:
+            out.append(
+                {
+                    "ageId": age_id,
+                    "name": row.get("name"),
+                    "days": row.get("days"),
+                    "ageGroupId": row.get("age_group_id"),
+                    "embryonic": row.get("embryonic"),
+                    "organismId": row.get("organism_id"),
+                }
+            )
+        else:
+            out.append({"ageId": age_id})
+    return out
+
+
+def build_allen_source_record(product: dict, age_map: dict | None = None) -> dict:
+    """Map an Allen Product (RMA include payload) → per-source canonical record.
+
+    ``product`` is the full product dict from ``model::Product`` with optional
+    ``data_sets`` / ``specimens`` / ``donors`` arrays (the include response).
+    ``age_map`` (optional) maps Allen Age ids → Age model rows for donor-age
+    summaries. Pure and deterministic; never fabricates values.
+
+    Child arrays are aggregated into statistics (``allen_child_stats``) and
+    the arrays themselves are NEVER stored — rawMetadata.allen contains only
+    the stripped product-level payload plus aggregated summaries.
+    """
+    product_id = str(product.get("id") or "").strip()
+    stats = allen_child_stats(product)
+    species_raw = product.get("species")
+    species = normalize_species(species_raw)
+
+    derived = {
+        "participantCount": None,  # Products are not participant-based
+        "ageGroup": None,          # donor ages are species-specific — never grouped
+        "sizeLabel": None,
+        "publicationYear": None,
+        "availability": availability_for(ALLEN_REPOSITORY, True),
+    }
+
+    source = {
+        # provenance / identity
+        "repository": ALLEN_REPOSITORY,
+        "sourceDatasetId": f"allen:{product_id}",
+        "sourceUrl": ALLEN_PRODUCT_URL.format(product_id=product_id),
+        "doi": None,  # no reliable dataset-level DOI — never fabricated
+        # core
+        "title": _as_str(product.get("name")),
+        "description": _as_str(product.get("description")),
+        "readme": None,
+        "license": None,             # no reliable dataset-level license
+        "licenseNormalized": None,
+        "datasetType": "product",    # Allen dataset-level unit = Product
+        "availability": derived["availability"],
+        "lastUpdated": None,
+        "createdAt": None,
+        "publishDate": None,
+        "authors": [],               # no structured author list on Product
+        "contributors": [],
+        # scientific metadata
+        "modality": [],              # no explicit Allen modality — never invented
+        "modalityRaw": [],
+        "species": species or None,
+        "speciesRaw": [species_raw] if species_raw else None,
+        "disease": None,             # condition_description is donor-level, not dataset-level
+        "brainRegions": None,        # no structured anatomy on Product
+        "ages": None,                # never fed into derive_age_groups
+        "ageGroup": None,
+        "ageMin": None,
+        "ageMax": None,
+        "participantCount": None,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": [],              # Product.tags is null for all 64 products
+        "analysisMethods": None,
+        # snapshot / product information
+        "snapshot": {
+            "productId": product_id,
+            "abbreviation": product.get("abbreviation"),
+            "resource": product.get("resource"),
+            "tags": product.get("tags"),
+            "dataSetCount": stats["dataSetCount"],
+            "sectionDataSetCount": stats["sectionDataSetCount"],
+            "microarrayDataSetCount": stats["microarrayDataSetCount"],
+            "atlasDataSetCount": stats["atlasDataSetCount"],
+            "specimenCount": stats["specimenCount"],
+            "donorCount": stats["donorCount"],
+            "genders": stats["donorSexes"],
+            "strains": stats["donorStrains"],
+            "donorConditions": stats["donorConditions"],
+            "donorAgeSummaries": _allen_age_summaries(stats["donorAgeIds"], age_map),
+        },
+        "datasetSizeBytes": None,
+        # publication information — none reliably available on the Product model
+        "publication": {
+            "publishDate": None,
+            "notes": "Allen Product model exposes no publication structure",
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": ALLEN_REPOSITORY,
+            "sourceApi": "api.brain-map.org/api/v2/data",
+            "retrievedAt": _utcnow(),
+            "direct": ["title", "description", "species", "resource"],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # stripped product-level payload + aggregated child summaries — the
+        # child ARRAYS (data_sets/specimens/donors) are NEVER stored.
+        "rawMetadata": {
+            "product": _allen_strip_product(product),
+            "apiUrl": ALLEN_PRODUCT_CRITERIA_URL.format(product_id=product_id),
+            "childStats": stats,
+        },
+    }
+    return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HCP / Connectome Coordination Facility ingestion (investigation 2026-08-16)
+#
+# Source: the CCF Drupal site (www.humanconnectome.org). No public JSON API is
+# exposed (verified: no /jsonapi, no REST routes; BALSA/ConnectomeDB is
+# login-gated and its /studies.json returns an HTML SPA shell). Metadata is
+# read from the public study pages — metadata only, zero asset/file crawling.
+#
+# Discovery (the two authoritative index pages, verified live):
+#   https://www.humanconnectome.org/lifespan-studies
+#   https://www.humanconnectome.org/disease-studies
+#   → exactly 20 unique study slugs (the sitemap is NOT authoritative — it
+#     was observed to omit two Studies, e.g. HCP-DES and Dual Mechanisms).
+#
+# Dataset unit = ONE HCP Study. 1 Study = 1 NeuroSearch dataset.
+# Releases are VERSIONS of a study (HCP-YA: 14 releases; HCP-Aging: 4) and are
+# NEVER separate datasets — they are aggregated under
+# rawMetadata.hcp.dataReleases[].
+#
+# Identity:
+#   sourceDatasetId = "hcp:<slug>"          (deterministic, locked decision)
+#   sourceKeys      = ["hcp:hcp:<slug>"]
+#   DOI             = None — HCP study pages expose no dataset-level DOI;
+#                     publication DOIs (hundreds per study) are preserved under
+#                     rawMetadata.hcp.publications and NEVER used as identity.
+#   sourceUrl       = https://www.humanconnectome.org/study/<slug> — the Study
+#                     landing page itself. Path-distinct per study so
+#                     normalize_url_key() keeps 20 distinct sourceUrlNorm
+#                     values (never the shared repo homepage, never a release/
+#                     document/publication URL, never BALSA).
+#
+# Canonical field mapping (never inferred from free text):
+#   title         = study name (h1)
+#   description   = Study Overview body (fallback: meta description)
+#   authors       = explicit Principal Investigator names (structured blocks)
+#   species       = None (no structured species field on the study pages)
+#   brainRegions  = None  (none structured; never inferred from text)
+#   modality      = []    (no structured modality field; MRI/MEG only appear
+#                     in free text — never converted to canonical labels)
+#   ages/ageGroup = None  (no structured ages)
+#   participantCount = None (subject counts appear only in release prose)
+#   doi/license   = None  (no dataset-level DOI; Data Use Terms is a
+#                     restricted-access agreement, not an open license)
+#
+# ZERO asset/file crawling — the fetcher requests ONLY the study page, the
+# data-releases page, and the publications page (metadata HTML only).
+# ─────────────────────────────────────────────────────────────────────────────
+
+HCP_REPOSITORY = "hcp"
+
+# The Study landing page — the canonical per-study sourceUrl.
+HCP_STUDY_URL = "https://www.humanconnectome.org/study/{slug}"
+
+# Authoritative discovery pages (verified live: 20 unique slugs each).
+HCP_INDEX_PAGES = (
+    "https://www.humanconnectome.org/lifespan-studies",
+    "https://www.humanconnectome.org/disease-studies",
+)
+
+# Sub-page URL patterns used for metadata enrichment (never ingested as units).
+HCP_DATA_RELEASES_URL = "https://www.humanconnectome.org/study/{slug}/data-releases"
+HCP_PUBLICATIONS_URL = "https://www.humanconnectome.org/study/{slug}/publications"
+HCP_DATA_USE_TERMS_URL = "https://www.humanconnectome.org/study/{slug}/data-use-terms"
+HCP_PROTOCOLS_URL = "https://www.humanconnectome.org/study/{slug}/project-protocols"
+
+# Study slugs are lowercase [a-z0-9-]+ — a bare /study/<slug> link ends right
+# after the slug (sub-pages continue with "/" and are excluded).
+_HCP_SLUG_RE = re.compile(r'href="/study/([a-z0-9][a-z0-9-]*)"')
+
+# Study CARDS live inside <div class="study-content"><h3><a href="/study/<slug>">
+# (verified live). The nav dropdown / sidebar also link studies — those are
+# navigation chrome, NOT catalog entries. The discovery gate therefore counts
+# duplicates WITHIN the card region only, so nav repetition is never mistaken
+# for a corrupted catalog.
+_HCP_CARD_RE = re.compile(
+    r'<div class="study-content">\s*<h3[^>]*>\s*<a href="/study/([a-z0-9][a-z0-9-]*)"'
+)
+
+
+class _HcpParseError(ValueError):
+    """Raised when a study page lacks the required structural elements."""
+
+
+def _hcp_clean_text(fragment: str | None) -> str | None:
+    """Strip tags + unescape HTML entities + collapse whitespace (pure)."""
+    if not fragment:
+        return None
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    text = _html_unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def hcp_index_slugs(html: str) -> list[str]:
+    """Unique study slugs linked from an index page (deterministic, sorted).
+
+    Only bare ``/study/<slug>`` links match — sub-page links (e.g.
+    ``/study/hcp-young-adult/data-releases``) and the sitemap are excluded.
+    Nav/sidebar chrome is included in the raw link scan (each page lists the
+    full 20 via the "Studies" dropdown); duplicates collapse via the set.
+    """
+    return sorted(set(hcp_index_slugs_raw(html)))
+
+
+def hcp_index_slugs_raw(html: str) -> list[str]:
+    """All ``/study/<slug>`` links in document order (duplicates preserved).
+
+    Used by the discovery gate to size the page and detect corruption.
+    """
+    return [m.group(1) for m in _HCP_SLUG_RE.finditer(html or "")]
+
+
+def hcp_index_card_slugs(html: str) -> list[str]:
+    """Slugs listed as study CARDS (the authoritative listing region).
+
+    Only ``study-content`` h3-anchored cards count as catalog entries; the
+    nav dropdown and sidebar are navigation chrome and are excluded. Used by
+    the discovery gate: a slug appearing in MORE than one card on a single
+    page is a corrupted catalog (duplicate study entry).
+    """
+    return [m.group(1) for m in _HCP_CARD_RE.finditer(html or "")]
+
+
+def hcp_parse_study_page(html: str, slug: str) -> dict:
+    """Parse a Study landing page → structured study metadata (pure).
+
+    Returns the explicit fields the page provides: name (h1), description
+    (Study Overview body, falling back to the meta description),
+    principalInvestigators (structured blocks), protocol-page presence,
+    data-use-terms URL, and any parseable last-modified marker.
+
+    Raises ``_HcpParseError`` when the page is not a recognizable study page.
+    """
+    html = html or ""
+    h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S)
+    name = _hcp_clean_text(h1.group(1)) if h1 else None
+    if not name:
+        raise _HcpParseError(f"no <h1> title on /study/{slug}")
+
+    # Description: prefer the Study Overview section body; fall back to the
+    # meta description (both are explicit page content, never inferred).
+    overview = re.search(
+        r"<h2[^>]*>Study Overview</h2>(.*?)(?:<h2[^>]*>|<footer)", html, re.S
+    )
+    description = _hcp_clean_text(overview.group(1)) if overview else None
+    if not description:
+        meta = re.search(r'<meta name="description" content="([^"]*)"', html)
+        description = _hcp_clean_text(meta.group(1)) if meta else None
+
+    # Principal Investigators — structured <div class="investigator principal">
+    # blocks with an <img alt="Name"> and <h3>… - Institution<span>role</span>.
+    # Each principal block is matched as a whole (the inner
+    # ``investigator__image`` div must not terminate the match).
+    investigators: list[dict] = []
+    for blk in re.finditer(
+        r'<div class="investigator principal">.*?<img[^>]*alt="([^"]+)"[^>]*>.*?<h3[^>]*>(.*?)</h3>',
+        html, re.S,
+    ):
+        pi_name = blk.group(1).strip()
+        h3_raw = blk.group(2)
+        role = None
+        role_m = re.search(r"<span[^>]*>(.*?)</span>", h3_raw, re.S)
+        if role_m:
+            role = _hcp_clean_text(role_m.group(1))
+        pre = re.sub(r"<[^>]+>", " ", h3_raw)
+        pre = _html_unescape(pre)
+        pre = re.sub(r"\s+", " ", pre).strip()
+        # "Kamil Ugurbil, Ph.D. - UMinn Principal Investigator" → institution.
+        # Drop the role words if they leaked into the text (span-less pages),
+        # then take the segment after the last " - " as the institution.
+        inst = None
+        if role and pre.endswith(role):
+            pre = pre[: -len(role)].strip()
+        pre = re.sub(r"\s+-", "-", pre)
+        dash = re.search(r"-\s*([A-Za-z0-9&.]+)\s*$", pre)
+        if dash:
+            inst = dash.group(1).strip()
+        investigators.append(
+            {"name": pi_name, "institution": inst, "role": role or "Principal Investigator"}
+        )
+
+    protocols: list[str] = []
+    if f"/study/{slug}/project-protocols" in html:
+        protocols.append(HCP_PROTOCOLS_URL.format(slug=slug))
+
+    lastmod = None
+    lm = re.search(r'<meta[^>]*name="(?:article:modified_time|lastmod)"[^>]*content="([^"]+)"', html)
+    if lm:
+        lastmod = lm.group(1).strip()
+
+    return {
+        "slug": slug,
+        "name": name,
+        "url": HCP_STUDY_URL.format(slug=slug),
+        "description": description,
+        "principalInvestigators": investigators,
+        "protocols": protocols,
+        "dataUseTermsUrl": HCP_DATA_USE_TERMS_URL.format(slug=slug),
+        "lastmod": lastmod,
+    }
+
+
+def hcp_parse_releases_page(html: str) -> list[dict]:
+    """Parse a Study data-releases page → aggregated release metadata (pure).
+
+    Releases are VERSIONS of the parent Study — this returns an aggregated
+    list [{name, date, url}] that is stored under rawMetadata.hcp.dataReleases;
+    releases are NEVER ingested as separate canonical datasets. The
+    "Let me explore the dataset" CTA block (no release date) is excluded.
+    """
+    out: list[dict] = []
+    for blk in re.finditer(
+        r'<div class="investigator">\s*<div class="investigator__image"><img[^>]*alt="([^"]+)"[^>]*></div>\s*<h3>(.*?)</h3>',
+        html or "", re.S,
+    ):
+        name = blk.group(1).strip()
+        h3 = blk.group(2)
+        if not name or name.lower().startswith("let me explore"):
+            continue
+        url_m = re.search(r'href="([^"]+)"', h3)
+        date_m = re.search(r"Released on\s*([0-9]{2}/[0-9]{2}/[0-9]{4})", h3)
+        if not date_m:
+            continue  # not a real release entry
+        out.append(
+            {
+                "name": name,
+                "date": date_m.group(1),
+                "url": url_m.group(1) if url_m else None,
+            }
+        )
+    return out
+
+
+def hcp_parse_publications_page(html: str) -> list[str]:
+    """Extract publication DOIs from a Study publications page (pure).
+
+    These are PUBLICATION identifiers — preserved under
+    rawMetadata.hcp.publications and never used as the canonical dataset DOI.
+    """
+    dois: list[str] = []
+    for m in re.finditer(r"10\.\d{4,9}/[A-Za-z0-9._\-/]+", html or ""):
+        doi = m.group(0).rstrip(".;,")
+        if doi not in dois:
+            dois.append(doi)
+    return dois
+
+
+def build_hcp_source_record(study: dict) -> dict:
+    """Map a parsed HCP Study → per-source canonical record.
+
+    ``study`` is the structured dict produced by ``hcp_parse_study_page``
+    plus the aggregated ``dataReleases`` / ``publications`` lists from the
+    corresponding sub-pages. Pure and deterministic; never fabricates values.
+
+    Releases are aggregated into ``rawMetadata.hcp.dataReleases`` (and a
+    bounded ``snapshot``), NEVER as separate canonical records.
+    """
+    slug = str(study.get("slug") or "").strip()
+    name = _as_str(study.get("name"))
+    investigators = study.get("principalInvestigators") or []
+    releases = study.get("dataReleases") or []
+    publications = study.get("publications") or []
+
+    authors = [
+        _as_str(pi.get("name")) for pi in investigators if _as_str(pi.get("name"))
+    ]
+
+    derived = {
+        "participantCount": None,  # subject counts appear only in release prose
+        "ageGroup": None,          # no structured ages — never fabricated
+        "sizeLabel": None,
+        "publicationYear": None,
+        "availability": availability_for(HCP_REPOSITORY, True),
+    }
+
+    source = {
+        # provenance / identity
+        "repository": HCP_REPOSITORY,
+        "sourceDatasetId": f"hcp:{slug}",
+        "sourceUrl": HCP_STUDY_URL.format(slug=slug),
+        "doi": None,  # no dataset-level DOI — publication DOIs are never identity
+        # core
+        "title": name,
+        "description": _as_str(study.get("description")),
+        "readme": None,
+        "license": None,             # Data Use Terms is a restricted-access agreement
+        "licenseNormalized": None,
+        "datasetType": "study",      # HCP dataset-level unit = Study
+        "availability": derived["availability"],
+        "lastUpdated": None,
+        "createdAt": None,
+        "publishDate": None,
+        "authors": authors,          # explicit PI names (structured blocks)
+        "contributors": [],
+        # scientific metadata
+        "modality": [],              # no structured modality — never invented
+        "modalityRaw": [],
+        "species": None,             # no structured species field on the pages
+        "speciesRaw": None,
+        "disease": None,             # disease only appears in study title/prose
+        "brainRegions": None,        # no structured anatomy on the pages
+        "ages": None,
+        "ageGroup": None,
+        "ageMin": None,
+        "ageMax": None,
+        "participantCount": None,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": [],
+        "analysisMethods": None,
+        # snapshot / study information (releases are metadata, never datasets)
+        "snapshot": {
+            "studySlug": slug,
+            "name": name,
+            "url": HCP_STUDY_URL.format(slug=slug),
+            "principalInvestigators": investigators,
+            "dataReleaseCount": len(releases),
+            "publicationCount": len(publications),
+            "lastmod": study.get("lastmod"),
+        },
+        "datasetSizeBytes": None,
+        # publication information — publication DOIs live under rawMetadata.hcp
+        "publication": {
+            "publishDate": None,
+            "notes": "HCP study pages expose publication DOIs (not a dataset DOI); "
+            "they are preserved under rawMetadata.hcp.publications",
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": HCP_REPOSITORY,
+            "sourceApi": "www.humanconnectome.org (Drupal study pages)",
+            "retrievedAt": _utcnow(),
+            "direct": ["title", "description", "authors", "principalInvestigators"],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # structured study metadata + aggregated releases/publications. The
+        # raw HTML is never stored — only the parsed, bounded metadata. The
+        # canonical wrapper keys this under ``rawMetadata.hcp`` (per-repo).
+        "rawMetadata": {
+            "slug": slug,
+            "name": name,
+            "url": HCP_STUDY_URL.format(slug=slug),
+            "description": _as_str(study.get("description")),
+            "principalInvestigators": investigators,
+            "dataReleases": releases,
+            "publications": publications,
+            "dataUseTerms": study.get("dataUseTermsUrl"),
+            "protocols": study.get("protocols") or [],
+            "lastmod": study.get("lastmod"),
         },
     }
     return source

@@ -30,11 +30,22 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.catalog.normalize import (
+    HCP_INDEX_PAGES,
+    HCP_PUBLICATIONS_URL,
+    HCP_DATA_RELEASES_URL,
+    build_allen_source_record,
     build_dandi_source_record,
+    build_hcp_source_record,
     build_nemar_source_record,
     build_neuromorpho_source_record,
     build_source_record,
     group_neuromorpho_neurons,
+    hcp_index_card_slugs,
+    hcp_index_slugs,
+    hcp_index_slugs_raw,
+    hcp_parse_publications_page,
+    hcp_parse_releases_page,
+    hcp_parse_study_page,
 )
 from app.catalog.persistence import get_collection, upsert_canonical
 from app.catalog.schema import CATALOG_COLLECTION
@@ -1149,3 +1160,633 @@ def _needed_group(group: dict, ids: list[str]) -> bool:
         if doi and doi.replace("/", "__") in candidate_id:
             return True
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Allen Brain Atlas Phase-1 ingestion
+#
+# Flow (investigation + implementation 2026-08-16):
+#    1. Enumerate ALL Products via the RMA query API
+#       (criteria=model::Product&num_rows=all → 64 rows, verified live)
+#    2. Fetch the Age model once (899 rows, small) for donor-age summaries
+#    3. Per product: criteria=model::Product[id$eqN]&include=data_sets,
+#       specimens,donors&num_rows=1 (bulk included relationships — the child
+#       arrays are aggregated into statistics and DISCARDED, never stored)
+#    4. build_allen_source_record() → validate → upsert_canonical()
+#
+# Dataset unit = ONE Allen Product. 1 Product = 1 NeuroSearch dataset.
+# ZERO asset/file crawling (SectionImages/images/raw data are never requested).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLEN_API_BASE = "https://api.brain-map.org/api/v2/data"
+ALLEN_EXPECTED_PRODUCTS = 64
+
+# The include payload for a product carries ALL its child DataSets / Specimens
+# / Donors (up to ~17 MB for the Mouse Brain atlas). We aggregate and discard.
+ALLEN_PRODUCT_INCLUDE = "data_sets,specimens,donors"
+
+
+def make_allen_fetchers(retry_counter: list[int], rate_limit_counter: list[int] | None = None):
+    """Build retry-wrapped Allen RMA fetchers.
+
+    ``retry_counter`` is appended to on every actual retry attempt so the
+    report can distinguish real retries from hard failures.
+    ``rate_limit_counter`` (optional) is appended to on every 429/503
+    (rate-limit) response observed, so the report records rate-limit
+    responses explicitly.
+    """
+
+    def _before_sleep(retry_state):
+        retry_counter.append(1)
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 503):
+            if rate_limit_counter is not None:
+                rate_limit_counter.append(1)
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=_before_sleep,
+    )
+    async def fetch_enumeration(client: httpx.AsyncClient) -> dict:
+        """All Products (base fields only)."""
+        resp = await client.get(
+            f"{ALLEN_API_BASE}/query.json",
+            params={"criteria": "model::Product", "num_rows": "all"},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=_before_sleep,
+    )
+    async def fetch_ages(client: httpx.AsyncClient) -> dict:
+        """All Age model rows (id → name/days/age_group_id/embryonic/organism)."""
+        resp = await client.get(
+            f"{ALLEN_API_BASE}/query.json",
+            params={"criteria": "model::Age", "num_rows": "all"},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=_before_sleep,
+    )
+    async def fetch_product(client: httpx.AsyncClient, product_id: int) -> dict:
+        """One Product with its child relationships included (bulk)."""
+        resp = await client.get(
+            f"{ALLEN_API_BASE}/query.json",
+            params={
+                "criteria": f"model::Product[id$eq{product_id}]",
+                "include": ALLEN_PRODUCT_INCLUDE,
+                "num_rows": 1,
+            },
+            timeout=300,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    return fetch_enumeration, fetch_ages, fetch_product
+
+
+async def run_allen_ingestion(
+    db,
+    *,
+    target: int | None = None,
+    ids: list[int] | None = None,
+    page_delay: float = 0.15,
+    client: httpx.AsyncClient | None = None,
+    log=print,
+) -> dict:
+    """Ingest Allen Brain Atlas Products into the canonical catalog (Phase 1).
+
+    - Enumerates ALL Products via the RMA query API and verifies the live
+      count against the expected 64 (recorded in ``stats``; the run tool
+      enforces the stop policy).
+    - ``ids`` (optional) restricts processing to the given product ids — used
+      by the smoke-test runner for a representative sample.
+    - ``target`` caps the number of products processed (retrieved).
+    - Child DataSets/Specimens/Donors are fetched via the bulk include and
+      aggregated into statistics; the child rows are never persisted.
+    - NEVER requests SectionImages / image files / raw data: ``asset_calls``
+      stays 0.
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "allen",
+        "discovered": 0,
+        "retrieved": 0,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_failures": 0,
+        "api_error_details": [],
+        "retries": 0,
+        "rate_limit_responses": 0,
+        "pages": 0,
+        "enumeration_requests": 0,
+        "age_requests": 0,
+        "product_requests": 0,
+        "asset_calls": 0,          # hard guarantee: no image/file crawling
+        "total_api_calls": 0,
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "expected_products": ALLEN_EXPECTED_PRODUCTS,
+        "enumerated_total": None,
+        "product_ids": [],
+        "child_stats_total": {
+            "dataSetCount": 0,
+            "specimenCount": 0,
+            "donorCount": 0,
+        },
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+        "target": target,
+    }
+
+    t0 = time.monotonic()
+    retry_counter: list[int] = []
+    rate_limit_counter: list[int] = []
+    fetch_enumeration, fetch_ages, fetch_product = make_allen_fetchers(
+        retry_counter, rate_limit_counter
+    )
+    owns_client = client is None
+    async with (client or httpx.AsyncClient(timeout=300)) as c:
+        # ── 1) Enumerate all Products. ─────────────────────────────────────
+        stats["enumeration_requests"] = 1
+        try:
+            enum = await fetch_enumeration(c)
+        except Exception as exc:  # noqa: BLE001 — page-level failure
+            stats["api_failures"] += 1
+            stats["api_error_details"].append(f"enumeration: {type(exc).__name__}: {exc}")
+            log(f"[allen] enumeration failed: {type(exc).__name__}: {exc}")
+            enum = None
+        if enum is None or not enum.get("success"):
+            log("[allen] enumeration failed — aborting")
+            stats["enumerated_total"] = 0
+            stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+            stats["finished_at"] = _utcnow()
+            return stats
+        stats["retries"] = len(retry_counter)
+        products = enum.get("msg") or []
+        stats["enumerated_total"] = enum.get("total_rows")
+        stats["discovered"] = len(products)
+        stats["product_ids"] = [
+            int(p["id"]) for p in products if isinstance(p, dict) and p.get("id") is not None
+        ]
+        log(
+            f"[allen] enumerated {len(products)} products "
+            f"(api total_rows={stats['enumerated_total']} expected={ALLEN_EXPECTED_PRODUCTS})"
+        )
+
+        # ── 2) Age model (one small bulk request) for donor-age summaries. ──
+        stats["age_requests"] = 1
+        age_map: dict[int, dict] = {}
+        try:
+            ages_payload = await fetch_ages(c)
+            for row in (ages_payload.get("msg") or []):
+                if isinstance(row, dict) and row.get("id") is not None:
+                    age_map[int(row["id"])] = row
+        except Exception as exc:  # noqa: BLE001 — ages are enrichment only
+            stats["api_failures"] += 1
+            stats["api_error_details"].append(f"ages: {type(exc).__name__}: {exc}")
+            log(f"[allen] ages fetch failed (non-fatal): {type(exc).__name__}: {exc}")
+
+        # ── 3) Per product: include payload → aggregate → normalize → persist.
+        pending = list(ids) if ids else list(stats["product_ids"])
+        for product_id in pending:
+            if target is not None and stats["retrieved"] >= target:
+                break
+            stats["product_requests"] += 1
+            try:
+                payload = await fetch_product(c, product_id)
+            except Exception as exc:  # noqa: BLE001
+                stats["api_failures"] += 1
+                stats["failure_details"].append(
+                    f"product {product_id}: fetch: {type(exc).__name__}: {exc}"
+                )
+                log(f"[allen] product {product_id} fetch failed: {type(exc).__name__}: {exc}")
+                continue
+            stats["retrieved"] += 1
+            stats["retries"] = len(retry_counter)
+
+            msg = payload.get("msg") or []
+            product = msg[0] if msg and isinstance(msg[0], dict) else None
+            if product is None:
+                stats["failed"] += 1
+                stats["failure_details"].append(f"product {product_id}: empty payload")
+                continue
+
+            try:
+                source = build_allen_source_record(product, age_map)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"product {product_id}: normalize: {exc}")
+                continue
+            stats["normalized"] += 1
+
+            child = (source.get("snapshot") or {})
+            for k in ("dataSetCount", "specimenCount", "donorCount"):
+                v = child.get(k) or 0
+                stats["child_stats_total"][k] = stats["child_stats_total"].get(k, 0) + v
+
+            errs = _validate_source(source)
+            if errs:
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(f"product {product_id}: {errs[0]}")
+                log(f"[allen] validation failed for product {product_id}: {errs}")
+                continue
+            stats["validated_ok"] += 1
+
+            try:
+                result = await upsert_canonical(collection, source)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"product {product_id}: upsert: {exc}")
+                log(f"[allen] upsert failed for product {product_id}: {exc}")
+                continue
+
+            if result.get("action") == "invalid":
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(
+                    f"product {product_id}: {result.get('errors', [])[:2]}"
+                )
+                log(f"[allen] canonical validation failed for product {product_id}")
+                continue
+
+            if result["action"] == "inserted":
+                stats["inserted"] += 1
+            else:
+                stats["merged"] += 1
+                via = result.get("matchedVia") or "unknown"
+                stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+            ambiguous = result.get("ambiguousCandidates") or []
+            if ambiguous:
+                stats["ambiguous_candidates"] += len(ambiguous)
+                if len(stats["ambiguous_sample"]) < 10:
+                    stats["ambiguous_sample"].append(
+                        {
+                            "source": f"allen:{product_id}",
+                            "candidates": [
+                                cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                            ],
+                        }
+                    )
+
+            await asyncio.sleep(page_delay)  # rate limit — do not hammer Allen
+
+    stats["asset_calls"] = 0  # hard guarantee: no asset/image crawling
+    stats["rate_limit_responses"] = len(rate_limit_counter)
+    stats["total_api_calls"] = (
+        stats["enumeration_requests"] + stats["age_requests"] + stats["product_requests"]
+    )
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[allen] done: enumerated={stats['discovered']} retrieved={stats['retrieved']} "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HCP / Connectome Coordination Facility ingestion
+#
+# Flow (investigation + implementation 2026-08-16):
+#    1. Discovery — fetch the two authoritative index pages
+#       (/lifespan-studies and /disease-studies) and extract the study slugs.
+#       The discovery gate requires EXACTLY 20 unique slugs with no
+#       duplicates; otherwise the runner stops BEFORE any write (partial
+#       catalogs are never silently ingested; the sitemap is NOT used — it
+#       was observed to omit two Studies).
+#    2. Per study — fetch the Study landing page (name/description/PIs),
+#       the data-releases page (aggregated release metadata) and the
+#       publications page (publication DOIs, quarantined from identity).
+#    3. build_hcp_source_record() → validate → upsert_canonical()
+#
+# Dataset unit = ONE HCP Study. Releases are versions, NEVER separate
+# datasets. ZERO asset/file crawling (ConnectomeDB/BALSA/file URLs are never
+# requested — only the three metadata HTML pages per study).
+# ─────────────────────────────────────────────────────────────────────────────
+
+HCP_EXPECTED_STUDIES = 20
+
+# The CCF Drupal site throttles rapid sequential requests — default delay is
+# deliberately polite (verified during investigation: sequential bursts time
+# out).
+HCP_DEFAULT_PAGE_DELAY = 1.0
+
+# Metadata HTML pages only. ConnectomeDB/BALSA/file endpoints are NEVER used.
+HCP_USER_AGENT = (
+    "Mozilla/5.0 (NeuroSearch catalog ingestion; metadata-only; contact: "
+    "neurosearch@example.org)"
+)
+
+
+def make_hcp_fetchers(retry_counter: list[int], rate_limit_counter: list[int] | None = None):
+    """Build retry-wrapped HCP Drupal page fetchers (metadata HTML only).
+
+    ``retry_counter`` is appended to on every actual retry attempt;
+    ``rate_limit_counter`` (optional) on every 429/503 rate-limit response.
+    Returns a single ``fetch_page(client, url) -> html`` fetcher — the HCP
+    site has no JSON API, so the pages themselves are the metadata source.
+    """
+
+    def _before_sleep(retry_state):
+        retry_counter.append(1)
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 503):
+            if rate_limit_counter is not None:
+                rate_limit_counter.append(1)
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=2, max=20),
+        reraise=True,
+        before_sleep=_before_sleep,
+    )
+    async def fetch_page(client: httpx.AsyncClient, url: str) -> str:
+        """One metadata HTML page (never an asset/file endpoint)."""
+        resp = await client.get(url, headers={"User-Agent": HCP_USER_AGENT}, timeout=60)
+        resp.raise_for_status()
+        return resp.text
+
+    return fetch_page
+
+
+async def run_hcp_ingestion(
+    db,
+    *,
+    ids: list[str] | None = None,
+    page_delay: float = HCP_DEFAULT_PAGE_DELAY,
+    client: httpx.AsyncClient | None = None,
+    log=print,
+) -> dict:
+    """Ingest HCP/CCF Studies into the canonical catalog.
+
+    Discovery gate (hard, before ANY write):
+      - both index pages must be fetched;
+      - the union of study slugs must contain EXACTLY ``HCP_EXPECTED_STUDIES``
+        (20) unique slugs with NO duplicates across the two pages;
+      - otherwise the runner records ``gate_failed`` and returns WITHOUT
+        writing anything (a partial or duplicated HCP catalog is never
+        silently ingested).
+
+    ``ids`` (optional) restricts processing to the given slugs (used by the
+    smoke-test runner). ``page_delay`` sets the polite inter-request delay
+    (the CCF site throttles rapid sequential requests).
+
+    Never requests assets/files/images: only the study page, the
+    data-releases page and the publications page are fetched per study
+    (``asset_calls`` stays 0).
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "hcp",
+        "discovered": 0,
+        "discovered_slugs": [],
+        "duplicate_slugs": [],
+        "gate_failed": False,
+        "gate_reason": None,
+        "expected_studies": HCP_EXPECTED_STUDIES,
+        "retrieved": 0,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_failures": 0,
+        "api_error_details": [],
+        "retries": 0,
+        "rate_limit_responses": 0,
+        "pages": 0,
+        "index_requests": 0,
+        "study_requests": 0,
+        "release_requests": 0,
+        "publication_requests": 0,
+        "asset_calls": 0,          # hard guarantee: no image/file crawling
+        "total_api_calls": 0,
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "release_metadata_total": 0,
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+    }
+
+    t0 = time.monotonic()
+    retry_counter: list[int] = []
+    rate_limit_counter: list[int] = []
+    fetch_page = make_hcp_fetchers(retry_counter, rate_limit_counter)
+    owns_client = client is None
+    async with (client or httpx.AsyncClient(timeout=60, follow_redirects=True)) as c:
+        # ── 1) Discovery — both authoritative index pages. ─────────────────
+        #    Each page lists the full 20 via the "Studies" nav dropdown plus a
+        #    subset of study CARDS. Nav/sidebar links are chrome and repeat
+        #    slugs legitimately; the discovery union therefore deduplicates
+        #    ALL links. A corrupted catalog is detected by a slug appearing in
+        #    MORE than one study CARD on a single page (duplicate listing).
+        unique_slugs: set[str] = set()
+        per_page_duplicates: list[str] = []
+        page_card_counts: list[int] = []
+        page_link_counts: list[int] = []
+        for index_url in HCP_INDEX_PAGES:
+            stats["index_requests"] += 1
+            try:
+                html = await fetch_page(c, index_url)
+            except Exception as exc:  # noqa: BLE001
+                stats["api_failures"] += 1
+                stats["api_error_details"].append(f"index {index_url}: {type(exc).__name__}: {exc}")
+                log(f"[hcp] index fetch failed: {index_url}: {type(exc).__name__}: {exc}")
+                continue
+            page_link_counts.append(len(hcp_index_slugs_raw(html)))
+            card_slugs = hcp_index_card_slugs(html)
+            page_card_counts.append(len(card_slugs))
+            seen_in_card: set[str] = set()
+            for s in card_slugs:
+                if s in seen_in_card and s not in per_page_duplicates:
+                    per_page_duplicates.append(s)
+                seen_in_card.add(s)
+            unique_slugs.update(hcp_index_slugs(html))
+        stats["retries"] = len(retry_counter)
+
+        unique_slugs = sorted(unique_slugs)
+        stats["discovered"] = len(unique_slugs)
+        stats["discovered_slugs"] = unique_slugs
+        stats["duplicate_slugs"] = per_page_duplicates
+        log(
+            f"[hcp] discovered {len(unique_slugs)} unique studies from "
+            f"{len(HCP_INDEX_PAGES)} index pages "
+            f"(cards_per_page={page_card_counts} links_per_page={page_link_counts} "
+            f"expected={HCP_EXPECTED_STUDIES} "
+            f"duplicate_cards={len(per_page_duplicates)})"
+        )
+
+        # ── Discovery gate: exactly 20 unique slugs, no within-page dupes. ──
+        if stats["discovered"] != HCP_EXPECTED_STUDIES or per_page_duplicates:
+            stats["gate_failed"] = True
+            stats["gate_reason"] = (
+                f"discovered={stats['discovered']} expected={HCP_EXPECTED_STUDIES} "
+                f"duplicates={len(per_page_duplicates)}"
+            )
+            log(f"[hcp] *** GATE FAILED: {stats['gate_reason']} — NOT writing anything ***")
+            stats["asset_calls"] = 0
+            stats["rate_limit_responses"] = len(rate_limit_counter)
+            stats["total_api_calls"] = stats["index_requests"]
+            stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+            stats["finished_at"] = _utcnow()
+            return stats
+
+        # ── 2) Per study: landing + data-releases + publications pages. ────
+        pending = list(ids) if ids else unique_slugs
+        for slug in pending:
+            if slug not in unique_slugs:
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{slug}: not in discovered set")
+                continue
+
+            # Study landing page (name/description/PIs).
+            stats["study_requests"] += 1
+            try:
+                study_html = await fetch_page(
+                    c, f"https://www.humanconnectome.org/study/{slug}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                stats["api_failures"] += 1
+                stats["failure_details"].append(
+                    f"{slug}: study page: {type(exc).__name__}: {exc}"
+                )
+                log(f"[hcp] study page fetch failed for {slug}: {type(exc).__name__}: {exc}")
+                continue
+            try:
+                study = hcp_parse_study_page(study_html, slug)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{slug}: parse study: {exc}")
+                log(f"[hcp] study parse failed for {slug}: {exc}")
+                continue
+            stats["retrieved"] += 1
+            stats["retries"] = len(retry_counter)
+
+            # Data releases page (aggregated metadata — never datasets).
+            stats["release_requests"] += 1
+            try:
+                releases_html = await fetch_page(c, HCP_DATA_RELEASES_URL.format(slug=slug))
+                study["dataReleases"] = hcp_parse_releases_page(releases_html)
+            except Exception as exc:  # noqa: BLE001 — enrichment only, non-fatal
+                stats["api_failures"] += 1
+                stats["api_error_details"].append(f"{slug} releases: {type(exc).__name__}: {exc}")
+                log(f"[hcp] releases fetch failed for {slug} (non-fatal): {type(exc).__name__}: {exc}")
+                study["dataReleases"] = []
+            stats["release_metadata_total"] += len(study.get("dataReleases") or [])
+
+            # Publications page (publication DOIs — quarantined from identity).
+            stats["publication_requests"] += 1
+            try:
+                pubs_html = await fetch_page(c, HCP_PUBLICATIONS_URL.format(slug=slug))
+                study["publications"] = hcp_parse_publications_page(pubs_html)
+            except Exception as exc:  # noqa: BLE001 — enrichment only, non-fatal
+                stats["api_failures"] += 1
+                stats["api_error_details"].append(f"{slug} pubs: {type(exc).__name__}: {exc}")
+                log(f"[hcp] publications fetch failed for {slug} (non-fatal): {type(exc).__name__}: {exc}")
+                study["publications"] = []
+
+            try:
+                source = build_hcp_source_record(study)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{slug}: normalize: {exc}")
+                continue
+            stats["normalized"] += 1
+
+            errs = _validate_source(source)
+            if errs:
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(f"{slug}: {errs[0]}")
+                log(f"[hcp] validation failed for {slug}: {errs}")
+                continue
+            stats["validated_ok"] += 1
+
+            try:
+                result = await upsert_canonical(collection, source)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(f"{slug}: upsert: {exc}")
+                log(f"[hcp] upsert failed for {slug}: {exc}")
+                continue
+
+            if result.get("action") == "invalid":
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(
+                    f"{slug}: {result.get('errors', [])[:2]}"
+                )
+                log(f"[hcp] canonical validation failed for {slug}")
+                continue
+
+            if result["action"] == "inserted":
+                stats["inserted"] += 1
+            else:
+                stats["merged"] += 1
+                via = result.get("matchedVia") or "unknown"
+                stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+            ambiguous = result.get("ambiguousCandidates") or []
+            if ambiguous:
+                stats["ambiguous_candidates"] += len(ambiguous)
+                if len(stats["ambiguous_sample"]) < 10:
+                    stats["ambiguous_sample"].append(
+                        {
+                            "source": f"hcp:{slug}",
+                            "candidates": [
+                                cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                            ],
+                        }
+                    )
+
+            await asyncio.sleep(page_delay)  # polite — the CCF site throttles
+
+    stats["asset_calls"] = 0  # hard guarantee: no asset/image crawling
+    stats["rate_limit_responses"] = len(rate_limit_counter)
+    stats["total_api_calls"] = (
+        stats["index_requests"]
+        + stats["study_requests"]
+        + stats["release_requests"]
+        + stats["publication_requests"]
+    )
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[hcp] done: discovered={stats['discovered']} retrieved={stats['retrieved']} "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"releases_aggregated={stats['release_metadata_total']} "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
