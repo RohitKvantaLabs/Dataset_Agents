@@ -60,6 +60,7 @@ AVAILABILITY_BY_REPOSITORY: dict[str, str] = {
     "openneuro": "open",
     "dandi": "open",
     "nemar": "open",  # NEMAR public datasets are always open access
+    "neuromorpho": "open",  # NeuroMorpho reconstructions are always open access
     "neurovault": "open",
     "zenodo": "open",
     "figshare": "open",

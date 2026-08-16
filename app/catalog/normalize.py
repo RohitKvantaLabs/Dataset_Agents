@@ -945,3 +945,366 @@ def _source_slim(source: dict) -> dict:
     slim = dict(source)
     slim.pop("rawMetadata", None)  # stored once per repo on the canonical doc
     return slim
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NeuroMorpho.Org catalog normalization (Phase 1 — investigation 2026-08-10)
+#
+# Dataset unit = Archive × Publication contribution.
+# Grouping algorithm:
+#   1. Collect all neuron metadata records from the Solr index.
+#   2. Group by (archive, real_PMID). Real PMIDs are positive integers;
+#      negative/sentinel values (e.g. ``-42``) are placeholders, NOT real.
+#   3. Records with no real PMID use (archive, real_DOI) as the group key.
+#      This covers the 54 DOI-only groups found in the full corpus.
+#   4. Within each group, aggregate species/brain regions/cell types
+#      deterministically (union of unique values).
+#
+# Identity:
+#   sourceDatasetId = "neuromorpho:<archive>:pmid:<PMID>" or
+#                     "neuromorpho:<archive>:doi:<normalized_DOI>"
+#   sourceUrl = contribution-UNIQUE (archive + contribution key in the path).
+#               The bare archive URL is shared by every contribution in an
+#               archive and would collapse distinct publications through the
+#               generic resolver's source_url signal — observed live: 27
+#               contributions wrongly merged. The path form survives
+#               normalize_url_key() (query/fragment are stripped), so each
+#               contribution gets a distinct sourceUrlNorm. The plain archive
+#               URL is preserved under rawMetadata.neuromorpho.archiveUrl.
+#   DOI = group's literature DOI (NOT cross-repo dedup identity). DOIs shared
+#         by 2+ distinct PMID groups WITHIN one archive are archive-level
+#         artifacts (e.g. Ascoli: 3 PMIDs all carrying 10.1016/...105) and are
+#         cleared from the PMID groups so the generic DOI signal cannot merge
+#         distinct publications; DOI-only groups always keep their DOI (it IS
+#         their contribution identity).
+#
+# ZERO asset/file crawling — metadata only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEUROMORPHO_REPOSITORY = "neuromorpho"
+
+# Regular expression to distinguish real PMIDs (positive integer strings)
+# from placeholders like "-42", "-4", or other sentinel values.
+_REAL_PMID_RE = re.compile(r"^\d+$")
+
+NEUROMORPHO_ARCHIVE_URL = "https://neuromorpho.org/archive"
+
+
+def _real_pmid(pmids: list | None) -> str | None:
+    """Return the first real (positive integer) PMID from the list, or None."""
+    for p in (pmids or []):
+        if p is not None and _REAL_PMID_RE.match(str(p)):
+            return str(p)
+    return None
+
+
+def _real_doi(dois: list | None) -> str | None:
+    """Return the first recognizable DOI from the list, or None."""
+    for d in (dois or []):
+        normalized = normalize_doi(str(d)) if d else None
+        if normalized:
+            return normalized
+    return None
+
+
+# The live Solr API exposes publication identity under ``reference_pmid`` /
+# ``reference_doi`` (lists) and the record id under ``neuron_id``; the
+# captured corpus (nm_neurons.jsonl) was normalized by the scan script to
+# ``pmids`` / ``dois`` / ``id``. Accept BOTH conventions (canonical first,
+# live API second) so grouping behaves identically on the raw API payload
+# and on the captured corpus.
+_NEURON_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "pmids": ("pmids", "reference_pmid"),
+    "dois": ("dois", "reference_doi"),
+    "id": ("id", "neuron_id"),
+}
+
+
+def _neuron_field(neuron: dict, canonical: str):
+    """Read a neuron field, trying canonical then live-API key names."""
+    for key in _NEURON_FIELD_ALIASES[canonical]:
+        if key in neuron:
+            return neuron.get(key)
+    return neuron.get(canonical)
+
+
+def group_neuromorpho_neurons(neurons: list[dict]) -> list[dict]:
+    """Group raw neuron metadata records into Archive × Publication
+    contribution groups — the canonical dataset-level unit.
+
+    Input: list of raw neuron dicts (from the Solr /neuron/select API).
+    Output: list of grouped contribution dicts, each ready for
+    ``build_neuromorpho_source_record()``.
+
+    Field-name compatibility: the live Solr API uses ``reference_pmid`` /
+    ``reference_doi`` / ``neuron_id``; the captured corpus uses ``pmids`` /
+    ``dois`` / ``id``. Both are accepted (see ``_NEURON_FIELD_ALIASES``).
+
+    Grouping rules:
+    - Primary group key: ``(archive, real_PMID)`` where PMID is a positive
+      integer string. One group per distinct (archive, PMID) pair.
+    - Fallback: ``(archive, real_DOI)`` when no real PMID exists. This
+      covers the 54 DOI-only groups found in the full corpus.
+    - Neurons with neither real PMID nor real DOI are discarded (1 found
+      in the full corpus of 298,339 — a 0.0003% edge case).
+    - Within each group, aggregate: neuron_count, species (union),
+      brain_regions (union), cell_types (union), genders (union),
+      age_min (min of min_ages), age_max (max of max_ages),
+      strains (union if present).
+    """
+    groups: dict[str, dict] = {}
+
+    for n in neurons:
+        archive = str(n.get("archive") or "").strip()
+        if not archive:
+            continue
+
+        pmid = _real_pmid(_neuron_field(n, "pmids"))
+        doi = _real_doi(_neuron_field(n, "dois"))
+
+        if pmid:
+            key = f"{archive}|real_pmid|{pmid}"
+            group_pmid = pmid
+            group_doi = doi or ""
+        elif doi:
+            key = f"{archive}|doi|{doi}"
+            group_pmid = ""
+            group_doi = doi
+        else:
+            continue  # no identity — 0.0003% edge case
+
+        if key not in groups:
+            groups[key] = {
+                "archive": archive,
+                "pmid": group_pmid,
+                "doi": group_doi,
+                "neuron_count": 0,
+                "species": set(),
+                "brain_regions": set(),
+                "cell_types": set(),
+                "genders": set(),
+                "age_min": float("inf"),
+                "age_max": float("-inf"),
+                "strains": set(),
+            }
+
+        g = groups[key]
+        g["neuron_count"] += 1
+
+        if n.get("species"):
+            g["species"].add(str(n["species"]).strip().lower())
+        if n.get("brain_region"):
+            for br in n["brain_region"]:
+                if isinstance(br, str) and br.strip():
+                    g["brain_regions"].add(br.strip())
+        if n.get("cell_type"):
+            for ct in n["cell_type"]:
+                if isinstance(ct, str) and ct.strip():
+                    g["cell_types"].add(ct.strip())
+        if n.get("gender"):
+            gt = str(n["gender"]).strip()
+            if gt and gt.lower() != "not reported":
+                g["genders"].add(gt)
+        if n.get("min_age") is not None:
+            try:
+                g["age_min"] = min(g["age_min"], float(n["min_age"]))
+            except (TypeError, ValueError):
+                pass
+        if n.get("max_age") is not None:
+            try:
+                g["age_max"] = max(g["age_max"], float(n["max_age"]))
+            except (TypeError, ValueError):
+                pass
+        if n.get("strain"):
+            st = str(n["strain"]).strip()
+            if st:
+                g["strains"].add(st)
+
+    # Finalize groups: convert sets to sorted lists, handle empty ages.
+    result = []
+    for g in groups.values():
+        g["species"] = sorted(g["species"])
+        g["brain_regions"] = sorted(g["brain_regions"])
+        g["cell_types"] = sorted(g["cell_types"])
+        g["genders"] = sorted(g["genders"])
+        g["strains"] = sorted(g["strains"])
+        if g["age_min"] == float("inf"):
+            g["age_min"] = None
+        if g["age_max"] == float("-inf"):
+            g["age_max"] = None
+        result.append(g)
+
+    # Archive-level DOI artifact guard: a DOI shared by 2+ distinct PMID
+    # groups in the SAME archive is an archive-level artifact (the archive's
+    # primary-paper DOI stamped on unrelated records). Clear it from those
+    # PMID groups so the generic DOI signal cannot merge distinct
+    # publications. DOI-only groups are untouched (their DOI IS their
+    # contribution identity).
+    _clear_within_archive_doi_artifacts(result)
+
+    return result
+
+
+def _clear_within_archive_doi_artifacts(groups: list[dict]) -> None:
+    """Clear DOIs shared by 2+ distinct PMID groups within one archive.
+
+    Mutates ``groups`` in place (deterministic). A DOI that appears on
+    multiple PMID groups inside a single archive is an archive-level
+    artifact, not a per-contribution identity — clearing it prevents the
+    generic resolver's DOI signal from merging distinct publications.
+    DOI-only groups (empty ``pmid``) always keep their DOI.
+    """
+    by_archive: dict[str, list[dict]] = {}
+    for g in groups:
+        by_archive.setdefault(g["archive"], []).append(g)
+
+    for gs in by_archive.values():
+        doi_pmids: dict[str, set] = {}
+        for g in gs:
+            if g.get("pmid") and g.get("doi"):
+                doi_pmids.setdefault(g["doi"], set()).add(g["pmid"])
+        for doi, pmids in doi_pmids.items():
+            if len(pmids) < 2:
+                continue
+            for g in gs:
+                if g.get("pmid") in pmids and g.get("doi") == doi:
+                    g["doi_artifact"] = g["doi"]
+                    g["doi"] = ""
+
+
+def build_neuromorpho_source_record(group: dict) -> dict:
+    """Map a grouped NeuroMorpho contribution → per-source canonical record.
+
+    ``group`` is one element of the list returned by
+    ``group_neuromorpho_neurons()``.
+
+    Identity:
+    - PMID-backed groups: sourceDatasetId = ``neuromorpho:<archive>:pmid:<PMID>``
+    - DOI-only groups: ``neuromorpho:<archive>:doi:<DOI>``
+    - sourceUrl = ``{NEUROMORPHO_ARCHIVE_URL}/{archive}``
+    - DOI = the group's real DOI (from PMID-backed or DOI-only group)
+    - title = archive name (the most stable repository-provided label)
+    """
+    archive = group.get("archive") or "unknown"
+    pmid = group.get("pmid") or ""
+    doi = group.get("doi") or ""
+
+    if pmid:
+        source_ds_id = f"neuromorpho:{archive}:pmid:{pmid}"
+        source_url = f"{NEUROMORPHO_ARCHIVE_URL}/{archive}/pmid/{pmid}"
+    else:
+        doi_slug = doi.replace("/", "__")
+        source_ds_id = f"neuromorpho:{archive}:doi:{doi_slug}"
+        source_url = f"{NEUROMORPHO_ARCHIVE_URL}/{archive}/doi/{doi_slug}"
+
+    archive_url = f"{NEUROMORPHO_ARCHIVE_URL}/{archive}"
+
+    title = archive  # archive name is the closest thing to a dataset label
+
+    normalized_doi = normalize_doi(doi) if doi else None
+
+    derived = {
+        "participantCount": None,   # not applicable (neurons != participants)
+        "ageGroup": None,           # min/max is range, not subject ages
+        "sizeLabel": None,          # no dataset size bytes available
+        "publicationYear": None,    # no date from neuron API
+        "availability": availability_for(NEUROMORPHO_REPOSITORY, True),
+    }
+
+    species_raw = group.get("species") or []
+    species_normalized = normalize_species(species_raw)
+
+    age_min = group.get("age_min")
+    age_max = group.get("age_max")
+
+    source = {
+        # provenance / identity
+        "repository": NEUROMORPHO_REPOSITORY,
+        "sourceDatasetId": source_ds_id,
+        "sourceUrl": source_url,
+        "doi": normalized_doi,
+        # core
+        "title": title,
+        "description": None,
+        "readme": None,
+        "license": None,
+        "licenseNormalized": None,
+        "datasetType": "morphology",
+        "availability": derived["availability"],
+        "lastUpdated": None,
+        "createdAt": None,
+        "publishDate": None,
+        "authors": [],
+        "contributors": [],
+        # scientific metadata
+        "modality": [],
+        "modalityRaw": [],
+        "species": species_normalized or None,
+        "speciesRaw": species_raw if species_raw else None,
+        "disease": None,
+        "brainRegions": group.get("brain_regions") or None,
+        "ages": None,
+        "ageGroup": None,
+        "ageMin": age_min,
+        "ageMax": age_max,
+        "participantCount": None,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": [],
+        "analysisMethods": None,
+        "neuronCount": group.get("neuron_count"),
+        # snapshot / version information
+        "snapshot": {
+            "archive": archive,
+            "pmid": pmid or None,
+            "doi": normalized_doi or None,
+            "neuronCount": group.get("neuron_count"),
+            "speciesList": group.get("species") or [],
+            "brainRegionList": group.get("brain_regions") or [],
+            "cellTypeList": group.get("cell_types") or [],
+            "genders": group.get("genders") or [],
+            "strains": group.get("strains") or [],
+            "ageMin": age_min,
+            "ageMax": age_max,
+        },
+        "datasetSizeBytes": None,
+        # publication information
+        "publication": {
+            "publishDate": None,
+            "pmid": pmid or None,
+            "doi": normalized_doi or None,
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": NEUROMORPHO_REPOSITORY,
+            "sourceApi": "neuromorpho.org/api/neuron/select",
+            "retrievedAt": _utcnow(),
+            "direct": ["species", "brainRegions", "cellTypes", "pmid", "doi"],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched grouped contribution data — preserved verbatim
+        "rawMetadata": {
+            "archive": archive,
+            "archiveUrl": archive_url,
+            "pmid": pmid or None,
+            "doi": normalized_doi or None,
+            "doiArtifact": group.get("doi_artifact"),
+            "neuronCount": group.get("neuron_count"),
+            "species": group.get("species"),
+            "brainRegions": group.get("brain_regions"),
+            "cellTypes": group.get("cell_types"),
+            "genders": group.get("genders"),
+            "strains": group.get("strains"),
+            "ageMin": age_min,
+            "ageMax": age_max,
+        },
+    }
+    return source

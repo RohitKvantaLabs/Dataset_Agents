@@ -32,7 +32,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.catalog.normalize import (
     build_dandi_source_record,
     build_nemar_source_record,
+    build_neuromorpho_source_record,
     build_source_record,
+    group_neuromorpho_neurons,
 )
 from app.catalog.persistence import get_collection, upsert_canonical
 from app.catalog.schema import CATALOG_COLLECTION
@@ -44,6 +46,9 @@ DANDI_API_BASE = "https://api.dandiarchive.org/api"
 
 # NEMAR backend API (investigation 2026-08-10 — live v0.9.7).
 NEMAR_API_BASE = "https://api.nemar.org"
+
+# NeuroMorpho.Org public Solr API (investigation 2026-08-10).
+NEUROMORPHO_API_BASE = "https://neuromorpho.org/api/neuron"
 
 GRAPHQL_URL = "https://openneuro.org/crn/graphql"
 
@@ -865,3 +870,282 @@ async def run_nemar_ingestion(
         f"elapsed={stats['elapsed_s']}s"
     )
     return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NeuroMorpho.Org Phase-1 ingestion
+#
+# Flow (investigation + exact-count report, 2026-08-10):
+#    1. Enumerate ALL neurons via Solr /select pagination
+#       (q=*:*&size=500&page=N; max page size = 500)
+#    2. Group in memory using group_neuromorpho_neurons() into
+#       Archive × Publication contribution groups
+#    3. For each group → build_neuromorpho_source_record() → validate →
+#       upsert_canonical()
+#
+# Dataset unit = 1 contribution group, NOT 1 neuron, NOT 1 archive.
+# Full corpus: 597 pages · 298,339 neurons · 1,696 contribution groups
+# (1,642 PMID-backed + 54 DOI-only).
+#
+# ZERO asset/file crawling (never calls SWC/ASC endpoints).
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEUROMORPHO_PAGE_SIZE = 500  # Solr server caps size at 500 (1000 rejected)
+
+
+def make_neuromorpho_fetchers(retry_counter: list[int]):
+    """Build retry-wrapped NeuroMorpho Solr fetchers."""
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+        before_sleep=lambda retry_state: retry_counter.append(1),
+    )
+    async def fetch_neuron_page(client: httpx.AsyncClient, page: int, page_size: int) -> dict:
+        """One ``/select?q=*:*&size=500&page=N`` page of neuron metadata."""
+        resp = await client.get(
+            f"{NEUROMORPHO_API_BASE}/select?q=*:*&size={page_size}&page={page}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    return fetch_neuron_page
+
+
+async def run_neuromorpho_ingestion(
+    db,
+    *,
+    target: int | None = None,
+    group_limit: int | None = None,
+    page_size: int = NEUROMORPHO_PAGE_SIZE,
+    page_delay: float = 0.15,
+    ids: list[str] | None = None,
+    neurons: list[dict] | None = None,
+    client: httpx.AsyncClient | None = None,
+    log=print,
+) -> dict:
+    """Ingest NeuroMorpho.Org contributions into the canonical catalog
+    (Phase 1).
+
+    Flow:
+    1. Enumerate all neuron metadata records (Solr pagination) OR accept
+       a pre-fetched list (``neurons`` param for test client).
+    2. Group by (archive × real PMID)/(archive × DOI) — see
+       ``group_neuromorpho_neurons()``.
+    3. For each contribution group, normalize → validate → upsert.
+
+    Args:
+        ``target``: cap on neuron pages processed (NOT groups).
+        ``group_limit``: cap on contribution groups processed.
+        ``ids``: restrict to specific sourceDatasetIds (for smoke tests).
+        ``neurons``: pre-fetched neuron records (for mocked tests).
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "neuromorpho",
+        "discovered": 0,                # neurons enumerated
+        "retrieved": 0,                 # contribution groups processed
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_failures": 0,
+        "api_error_details": [],
+        "retries": 0,
+        "pages": 0,
+        "neuron_requests": 0,
+        "asset_calls": 0,               # Phase 1 never touches files
+        "total_api_calls": 0,
+        "neuron_count": 0,               # total neuron records processed
+        "groups_formed": 0,              # groups from grouping
+        "pmid_backed_groups": 0,
+        "doi_only_groups": 0,
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+        "target": target,
+        "group_limit": group_limit,
+    }
+
+    t0 = time.monotonic()
+    retry_counter: list[int] = []
+    fetch_neuron_page = make_neuromorpho_fetchers(retry_counter)
+    owns_client = client is None
+    async with (client or httpx.AsyncClient(timeout=90)) as c:
+        # ── 1) Enumerate all neuron records (Solr pagination). ──────────────
+        all_neurons: list[dict] = []
+        if neurons is not None:
+            all_neurons = list(neurons)
+            stats["discovered"] = len(all_neurons)
+        else:
+            page = 0
+            consecutive_failures = 0
+            while True:
+                if target is not None and stats["discovered"] >= target * page_size:
+                    break
+                stats["pages"] += 1
+                stats["neuron_requests"] = stats["pages"]
+                try:
+                    data = await fetch_neuron_page(c, page, page_size)
+                    consecutive_failures = 0
+                except Exception as exc:  # noqa: BLE001
+                    stats["api_failures"] += 1
+                    stats["api_error_details"].append(
+                        f"neuron page {stats['pages']} (page={page}): {type(exc).__name__}: {exc}"
+                    )
+                    log(f"[neuromorpho] page {stats['pages']} failed: {type(exc).__name__}: {exc}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        log("[neuromorpho] too many consecutive failures — aborting")
+                        break
+                    await asyncio.sleep(page_delay * 2)
+                    continue
+                stats["retries"] = len(retry_counter)
+                recs = (data.get("_embedded") or {}).get("neuronResources") or []
+                total_elements = (data.get("page") or {}).get("totalElements") or 0
+                all_neurons.extend(recs)
+                stats["discovered"] = len(all_neurons)
+                log(
+                    f"[neuromorpho] page {stats['pages']}: page={page} records={len(recs)} "
+                    f"totalElements={total_elements} discovered={len(all_neurons)}"
+                )
+                if not recs:
+                    break
+                if total_elements and len(all_neurons) >= total_elements:
+                    break
+                page += 1
+                await asyncio.sleep(page_delay)
+
+        stats["neuron_count"] = len(all_neurons)
+        log(f"[neuromorpho] enumerated {len(all_neurons)} neurons across {stats['pages']} pages")
+
+        # ── 2) Group into contribution groups. ─────────────────────────────
+        groups = group_neuromorpho_neurons(all_neurons)
+        # Free neuron memory before processing groups.
+        del all_neurons
+        stats["groups_formed"] = len(groups)
+        stats["pmid_backed_groups"] = sum(1 for g in groups if g.get("pmid"))
+        stats["doi_only_groups"] = sum(1 for g in groups if not g.get("pmid") and g.get("doi"))
+        log(f"[neuromorpho] grouped into {len(groups)} contributions "
+            f"({stats['pmid_backed_groups']} PMID + {stats['doi_only_groups']} DOI-only)")
+
+        # Filter by ids if specified (for smoke-test targeting).
+        if ids:
+            groups = [
+                g for g in groups
+                if _needed_group(g, ids)
+            ]
+            stats["groups_formed"] = len(groups)
+            log(f"[neuromorpho] filtered to {len(groups)} groups by ids")
+
+        # Cap by group_limit if set.
+        if group_limit is not None and len(groups) > group_limit:
+            groups = groups[:group_limit]
+            stats["groups_formed"] = len(groups)
+
+        # ── 3) Normalize + validate + dedup + persist each group. ─────────
+        for g in groups:
+            if target is not None and stats["retrieved"] >= target:
+                break
+
+            try:
+                source = build_neuromorpho_source_record(g)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(
+                    f"group {g.get('archive')}:{g.get('pmid') or g.get('doi')}: normalize: {exc}"
+                )
+                continue
+            stats["retrieved"] += 1
+            stats["normalized"] += 1
+
+            errs = _validate_source(source)
+            if errs:
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(
+                    f"{source.get('sourceDatasetId')}: {errs[0]}"
+                )
+                log(f"[neuromorpho] validation failed for {source.get('sourceDatasetId')}: {errs}")
+                continue
+            stats["validated_ok"] += 1
+
+            try:
+                result = await upsert_canonical(collection, source)
+            except Exception as exc:  # noqa: BLE001
+                stats["failed"] += 1
+                stats["failure_details"].append(
+                    f"{source.get('sourceDatasetId')}: upsert: {exc}"
+                )
+                log(f"[neuromorpho] upsert failed for {source.get('sourceDatasetId')}: {exc}")
+                continue
+
+            if result.get("action") == "invalid":
+                stats["validation_failed"] += 1
+                stats["validation_errors"].append(
+                    f"{source.get('sourceDatasetId')}: {result.get('errors', [])[:2]}"
+                )
+                log(f"[neuromorpho] canonical validation failed for {source.get('sourceDatasetId')}")
+                continue
+
+            if result["action"] == "inserted":
+                stats["inserted"] += 1
+            else:
+                stats["merged"] += 1
+                via = result.get("matchedVia") or "unknown"
+                stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+            ambiguous = result.get("ambiguousCandidates") or []
+            if ambiguous:
+                stats["ambiguous_candidates"] += len(ambiguous)
+                if len(stats["ambiguous_sample"]) < 10:
+                    stats["ambiguous_sample"].append(
+                        {
+                            "source": source["sourceDatasetId"],
+                            "candidates": [
+                                cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                            ],
+                        }
+                    )
+
+            await asyncio.sleep(page_delay)
+
+    stats["asset_calls"] = 0  # hard guarantee: no asset/file crawling
+    stats["total_api_calls"] = stats["neuron_requests"]
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[neuromorpho] done: neurons={stats['neuron_count']} "
+        f"groups={stats['groups_formed']} "
+        f"retrieved={stats['retrieved']} "
+        f"normalized={stats['normalized']} "
+        f"inserted={stats['inserted']} "
+        f"merged={stats['merged']} "
+        f"failed={stats['failed']} "
+        f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
+
+
+def _needed_group(group: dict, ids: list[str]) -> bool:
+    """Check if a group matches any of the given sourceDatasetId prefixes."""
+    archive = group.get("archive", "")
+    pmid = group.get("pmid", "")
+    doi = group.get("doi", "")
+    for candidate_id in ids:
+        if archive in candidate_id:
+            return True
+        if pmid and pmid in candidate_id:
+            return True
+        if doi and doi.replace("/", "__") in candidate_id:
+            return True
+    return False
