@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from app.catalog.schema import derive_age_groups, normalize_doi, normalize_title, normalize_url_key
 
+from app.catalog.normalize import SHARED_SOURCE_URL_REPOSITORIES
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Identity keys
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,10 +49,21 @@ CROSS_REF_PATTERNS: tuple[tuple[str, str], ...] = (
 
 
 def source_identity(source: dict) -> dict:
-    """Deterministic identity keys for a per-source record (pure)."""
+    """Deterministic identity keys for a per-source record (pure).
+
+    For repositories in ``SHARED_SOURCE_URL_REPOSITORIES`` (e.g. ADNI) the
+    source URL is shared documentation — it is NEVER an identity signal, so
+    ``sourceUrlNorm`` is None and the resolver skips the URL layer (ADNI
+    products co-located on one page stay distinct via sourceKey).
+    """
+    shared_url_repo = source.get("repository") in SHARED_SOURCE_URL_REPOSITORIES
     return {
         "doi": normalize_doi(source.get("doi")),
-        "sourceUrlNorm": normalize_url_key(source.get("sourceUrl")),
+        "sourceUrlNorm": (
+            None
+            if shared_url_repo
+            else normalize_url_key(source.get("sourceUrl"))
+        ),
         "sourceKey": f"{source.get('repository')}:{source.get('sourceDatasetId')}",
         "titleNorm": normalize_title(source.get("title")),
         "authorsNorm": {

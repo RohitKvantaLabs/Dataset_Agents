@@ -876,15 +876,26 @@ def canonical_record_from_source(source: dict) -> dict:
 
     Identity priority for the canonical ID (spec §9):
     1. DOI  2. canonical source URL  3. repository:sourceDatasetId.
+
+    Repositories in ``SHARED_SOURCE_URL_REPOSITORIES`` (e.g. ADNI) skip the
+    URL layer entirely: their sourceUrl is a shared documentation URL, so the
+    deterministic ``repository:sourceDatasetId`` is the identity and
+    ``provenance.identity.sourceUrlNorm`` stays None.
     """
     doi = source.get("doi")
-    url_norm = normalize_url_key(source.get("sourceUrl")) or ""
+    repository = source.get("repository")
+    if repository in SHARED_SOURCE_URL_REPOSITORIES:
+        # ADNI: sourceUrl is shared documentation — never identity. Co-located
+        # products must stay distinct even when they point at the same page.
+        url_norm = None
+    else:
+        url_norm = normalize_url_key(source.get("sourceUrl")) or ""
     if doi:
         primary = f"doi:{doi}"
     elif url_norm:
         primary = f"url:{url_norm}"
     else:
-        primary = f"{source.get('repository')}:{source.get('sourceDatasetId')}"
+        primary = f"{repository}:{source.get('sourceDatasetId')}"
 
     return {
         "canonicalDatasetId": make_canonical_id(primary),
@@ -2158,6 +2169,206 @@ def build_dryad_source_record(record: dict) -> dict:
         # derived summary (explicit direct-vs-derived split, spec §2)
         "derived": derived,
         # untouched census-artifact record — preserved verbatim (spec §11)
+        "rawMetadata": record,
+    }
+    return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADNI ingestion normalization (implementation + dry-run 2026-08-17)
+#
+# Dataset unit = ONE named, approved ADNI dataset-level product.
+# Approved input = the 122 records of the validated ADNI census artifact
+# (trace_artifacts/adni_census_20260817/adni_census.json). A hard gate
+# requires EXACTLY 122 records — every extra/missing record refuses the run.
+#
+# Identity:
+#   sourceDatasetId = "adni:<stable_identifier>"  (deterministic; the artifact
+#                   stable identifier IS the repository identity — one named
+#                   product, one canonical record).
+#   sourceKeys      = ["adni:adni:<stable_identifier>"]
+#   DOI             = None. ADNI products carry NO dataset-level DOI — the
+#                   canonical doi is ALWAYS null. Census publication_doi is
+#                   relationship metadata only (source["publication"]["articleDoi"]),
+#                   never canonical identity.
+#   sourceUrl       = the census source_url VERBATIM — always the real official
+#                   ADNI/LONI page, never a generated path. Shared official
+#                   URLs are legitimate and expected: many approved products
+#                   co-locate on a Documentation section page (bioflood.html /
+#                   pet.html / filetour.html / schars.html) or on a news/
+#                   announcement index (e.g. news-publications/news). Sharing
+#                   a URL does NOT make two products the same dataset.
+#   sourceUrlNorm   = None for ADNI. The normalized URL is NEVER an identity
+#                   signal for ADNI — a co-located product would otherwise
+#                   collapse into the shared-URL merge trap (the NeuroMorpho
+#                   bug that merged 27 wrong contributions, see the
+#                   neuroMorpho section note). This is enforced globally via
+#                   SHARED_SOURCE_URL_REPOSITORIES (below): both the
+#                   canonical-ID derivation (canonical_record_from_source) and
+#                   the generic identity resolver (dedup.source_identity) skip
+#                   the URL layer for those repositories and identify ADNI
+#                   products by the deterministic repository:sourceDatasetId.
+#                   The plain official ADNI page is also preserved verbatim
+#                   under source["documentationUrl"] and rawMetadata.adni.
+#
+# Canonical field mapping (never inferred from free text):
+#   modality  = strict map of the EXPLICIT census modality label into the
+#               canonical vocab: MRI → mri, PET → pet. Labels outside the
+#               vocab (Biofluid, Clinical, Genetics, Metabolomics, ...) stay
+#               out of the canonical list — they are preserved raw under
+#               modalityRaw and snapshot.modalityLabel, never coerced.
+#   availability = None: ADNI is Controlled-access (LONI IDA; DUA + DPC
+#               approval) — never reported as open.
+#   participantCount / ages / ageGroup = None: the census records no
+#               participant counts or ages; nothing is invented.
+#   disease/brainRegions/species/analysisMethods = None: no structured
+#               dataset-level values exist on the census.
+#   phases / updates: ADNI1/GO/2/3/4 phases and update announcements are
+#               grouped under ONE canonical record — preserved in the phase /
+#               versionUpdateInfo fields of snapshot and rawMetadata.adni.
+#
+# ZERO asset/file crawling — metadata only (api_calls and asset_calls stay 0).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ADNI_REPOSITORY = "adni"
+
+# Repositories whose sourceUrl is a SHARED documentation/locator URL rather
+# than a per-product locator. For these the normalized URL is NEVER an
+# identity signal: two products co-located on one official page are distinct
+# datasets, identified by the deterministic repository:sourceDatasetId. Both
+# the canonical-ID derivation (canonical_record_from_source) and the generic
+# identity resolver (dedup.source_identity) honor this set, so ADNI products
+# sharing a URL never merge. Other repositories are untouched.
+SHARED_SOURCE_URL_REPOSITORIES: frozenset[str] = frozenset({ADNI_REPOSITORY})
+
+# The ADNI census artifact contains exactly 122 approved dataset-level records.
+# This is a hard gate: input != 122 refuses the entire run before any write.
+ADNI_CENSUS_EXPECTED = 122
+
+# Strict map of the explicit census modality label → canonical modality vocab.
+# MRI → mri, PET → pet; every other census label is out of the canonical vocab.
+_ADNI_MODALITY_MAP: dict[str, str] = {"MRI": "mri", "PET": "pet"}
+
+
+def _adni_modality(modality_raw) -> list[str]:
+    """Census modality label → canonical modality vocab (strict map only)."""
+    label = None
+    if isinstance(modality_raw, list) and modality_raw:
+        label = str(modality_raw[0]).strip()
+    elif isinstance(modality_raw, str):
+        label = modality_raw.strip()
+    mapped = _ADNI_MODALITY_MAP.get((label or "").upper())
+    return [mapped] if mapped else []
+
+
+def build_adni_source_record(record: dict) -> dict:
+    """Map one ADNI census artifact record → per-source canonical record.
+
+    ``record`` is one dict of the approved ADNI census artifact
+    (adni_census.json → datasets[], metadata only — never a file payload).
+    sourceUrl is the census source_url VERBATIM (the real official ADNI/LONI
+    page) — never a generated path. Products sharing a URL remain distinct
+    datasets: identity comes from the deterministic sourceDatasetId /
+    sourceKeys (see SHARED_SOURCE_URL_REPOSITORIES). Pure and deterministic;
+    no fabrication of missing values.
+    """
+    stable_id = _as_str(record.get("stable_identifier"))
+    ds_id = f"{ADNI_REPOSITORY}:{stable_id}" if stable_id else None
+    doc_url = _as_str(record.get("source_url"))
+    publication_doi = normalize_doi(record.get("publication_doi"))
+
+    # ── Derived NeuroSearch fields (documented deterministic rules) ─────────
+    derived = {
+        "participantCount": None,  # census records no participant counts
+        "ageGroup": None,          # no structured ages on the census
+        "sizeLabel": None,         # census carries no dataset size
+        "publicationYear": None,   # census carries no publication year
+        "availability": None,      # ADNI = Controlled-access (DUA + DPC) — never open
+    }
+
+    source = {
+        # provenance / identity
+        "repository": ADNI_REPOSITORY,
+        "sourceDatasetId": ds_id,
+        "sourceUrl": doc_url,  # census source_url verbatim — the real official page
+        "doi": None,  # ADNI products have NO dataset-level DOI — never fabricated
+        # core
+        "title": _as_str(record.get("dataset_name")),
+        "description": _as_str(record.get("description")),
+        "readme": None,
+        "license": None,             # distribution governed by ADNI DUA/DPC — no dataset-level license
+        "licenseNormalized": None,
+        "datasetType": None,         # census "dataset" classification kept in snapshot
+        "availability": derived["availability"],
+        "lastUpdated": _parse_timestamp(record.get("last_update")),
+        "createdAt": None,
+        "publishDate": None,
+        "authors": [],               # census lists no authors — never invented
+        "contributors": [],
+        # scientific metadata — strict/circumscribed (see section note)
+        "modality": _adni_modality(record.get("modality")),
+        "modalityRaw": _str_list([record.get("modality")]) if record.get("modality") else [],
+        "species": None,
+        "speciesRaw": None,
+        "disease": None,
+        "brainRegions": None,
+        "ages": None,
+        "ageGroup": None,
+        "participantCount": None,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": [],              # census carries no keyword list
+        "analysisMethods": None,
+        # snapshot / product information
+        "snapshot": {
+            "stableIdentifier": stable_id,
+            "category": record.get("category"),
+            "modalityLabel": record.get("modality"),
+            "phase": record.get("phase"),
+            "accessLevel": record.get("access_level"),
+            "classification": record.get("classification"),
+            "firstAnnounced": record.get("first_announced"),
+            "lastUpdate": record.get("last_update"),
+            "versionUpdateInfo": record.get("version_update_info"),
+            "exclusionReason": record.get("exclusion_reason"),
+            "metadataFieldsAvailable": _str_list(record.get("metadata_fields_available")),
+        },
+        "datasetSizeBytes": None,
+        # official ADNI product/documentation page — verbatim census URL; the
+        # deterministic sourceDatasetId/sourceKeys, not the URL, are identity.
+        "documentationUrl": doc_url,
+        # publication information — the census publication DOI is relationship
+        # metadata ONLY, quarantined from identity (canonical doi stays null).
+        "publication": {
+            "publishDate": None,
+            "articleDoi": publication_doi,
+            "relatedIdentifiers": (
+                [{"identifier": publication_doi}] if publication_doi else []
+            ),
+            "funding": [],
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": ADNI_REPOSITORY,
+            "sourceApi": "adni.loni.usc.edu census artifact 2026-08-17",
+            "retrievedAt": _utcnow(),
+            "direct": [
+                "dataset_name", "description", "category", "modality", "phase",
+                "source_url", "access_level", "first_announced", "last_update",
+                "version_update_info", "publication_doi", "metadata_fields_available",
+                "classification", "exclusion_reason", "documentation_section",
+            ],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched ADNI census-artifact record — preserved verbatim (spec §11)
         "rawMetadata": record,
     }
     return source
