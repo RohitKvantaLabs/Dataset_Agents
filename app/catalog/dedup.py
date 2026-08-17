@@ -42,6 +42,7 @@ CROSS_REF_PATTERNS: tuple[tuple[str, str], ...] = (
     ("nitrc", "nitrc.org/projects/"),
     ("brainlife", "brainlife.io/datasets/"),
     ("ebrains", "ebrains.eu/"),
+    ("dryad", "datadryad.org/dataset/"),
 )
 
 

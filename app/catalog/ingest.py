@@ -33,8 +33,10 @@ from app.catalog.normalize import (
     HCP_INDEX_PAGES,
     HCP_PUBLICATIONS_URL,
     HCP_DATA_RELEASES_URL,
+    DRYAD_HIGH_CONFIDENCE,
     build_allen_source_record,
     build_dandi_source_record,
+    build_dryad_source_record,
     build_hcp_source_record,
     build_nemar_source_record,
     build_neuromorpho_source_record,
@@ -1787,6 +1789,205 @@ async def run_hcp_ingestion(
         f"merged={stats['merged']} failed={stats['failed']} "
         f"api_calls={stats['total_api_calls']} (asset_calls={stats['asset_calls']}) "
         f"releases_aggregated={stats['release_metadata_total']} "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dryad ingestion (implementation + dry-run 2026-08-17)
+#
+# Flow:
+#    1. Input — the AUTHORITATIVE census artifact
+#       (trace_artifacts/dryad_census_20260817/dryad_candidates.jsonl).
+#       Every record must carry the HIGH-confidence classification ("H");
+#       MEDIUM / LOW / FALSE-POSITIVE records are REFUSED by a hard gate —
+#       the adapter never silently expands the candidate set.
+#    2. Normalize each HIGH-confidence record via build_dryad_source_record().
+#    3. The existing generic pipeline: validate → resolve_identity →
+#       upsert_canonical() (insert or merge into the existing canonical
+#       record). No new identity/dedup/persistence logic is introduced.
+#
+# Metadata-only: the census artifact already contains the full Dryad record
+# (DOI, title, abstract, authors, keywords, fieldOfScience, relatedWorks,
+# license, file METADATA, versions) — ZERO Dryad API calls and ZERO
+# asset/file downloads are needed. ``api_calls`` and ``asset_calls`` stay 0.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _dryad_identity_keys(record: dict) -> list[str]:
+    """Deterministic candidate-identity keys for duplicate protection.
+
+    Mirrors what the generic resolver will use: the canonical DOI and the
+    source key (repository:sourceDatasetId). Returns [] when a record has no
+    usable identity (caught as a normalization failure downstream).
+    """
+    keys: list[str] = []
+    identifier = record.get("identifier") or ""
+    if identifier:
+        # census identifiers carry the doi: prefix ("doi:10.5061/dryad.gc72v")
+        raw = str(identifier).strip()
+        if raw.lower().startswith("doi:"):
+            raw = raw[4:].strip()
+        keys.append(f"doi:{raw}")
+    ds_id = record.get("id")
+    if ds_id is not None and str(ds_id).strip():
+        keys.append(f"dryad:dryad:{str(ds_id).strip()}")
+    return keys
+
+
+async def run_dryad_ingestion(
+    db,
+    *,
+    candidates: list[dict],
+    log=print,
+) -> dict:
+    """Ingest the validated Dryad HIGH-confidence dataset set (metadata only).
+
+    ``candidates`` is the authoritative ingestion list — each dict is one
+    census-artifact Dryad dataset (dryad_candidates.jsonl line). A hard gate
+    refuses any record whose ``classification`` is not the validated
+    HIGH-confidence label, so MEDIUM / LOW / FALSE-POSITIVE records can never
+    enter the catalog through this adapter.
+
+    Never requests Dryad API endpoints or dataset files: the census artifact
+    already carries all metadata needed for canonical insertion.
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "dryad",
+        "input": len(candidates),
+        "high_confidence": 0,
+        "excluded_non_high": 0,
+        "gate_failed": False,
+        "gate_reason": None,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "duplicate_source_identities": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_calls": 0,       # census artifact is authoritative — no API calls
+        "asset_calls": 0,     # hard guarantee: no file/asset downloads
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+    }
+
+    t0 = time.monotonic()
+
+    # ── 1) HIGH-confidence gate — refuse anything that isn't "H". ───────────
+    high = [
+        c for c in candidates
+        if str(c.get("classification") or "").strip().upper() == DRYAD_HIGH_CONFIDENCE
+    ]
+    excluded = [
+        c for c in candidates
+        if str(c.get("classification") or "").strip().upper() != DRYAD_HIGH_CONFIDENCE
+    ]
+    stats["high_confidence"] = len(high)
+    stats["excluded_non_high"] = len(excluded)
+    if excluded:
+        stats["gate_failed"] = True
+        stats["gate_reason"] = (
+            f"{len(excluded)} non-HIGH-confidence records in the ingestion input "
+            f"(classifications={sorted({c.get('classification') for c in excluded})})"
+        )
+        log(f"[dryad] *** GATE FAILED: {stats['gate_reason']} — NOT writing anything ***")
+        stats["finished_at"] = _utcnow()
+        stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    # ── 2) Duplicate candidate protection (same DOI / source key twice). ────
+    # The census artifact is deduplicated, so ANY repeated identity key in the
+    # input is a genuine duplicate — the generic resolver would merge them, but
+    # the adapter detects and reports it up front.
+    seen: dict[str, str] = {}
+    for c in high:
+        for key in _dryad_identity_keys(c):
+            prev = seen.get(key)
+            if prev is not None:
+                stats["duplicate_source_identities"].append(
+                    {"identity": key, "first": prev, "second": c.get("identifier")}
+                )
+            else:
+                seen[key] = c.get("identifier")
+
+    # ── 3) Normalize → validate → generic upsert (insert or merge). ─────────
+    for c in high:
+        try:
+            source = build_dryad_source_record(c)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["failure_details"].append(
+                f"{c.get('identifier')}: normalize: {type(exc).__name__}: {exc}"
+            )
+            log(f"[dryad] normalize failed for {c.get('identifier')}: {exc}")
+            continue
+        stats["normalized"] += 1
+
+        errs = _validate_source(source)
+        if errs:
+            stats["validation_failed"] += 1
+            stats["validation_errors"].append(f"{c.get('identifier')}: {errs[0]}")
+            log(f"[dryad] validation failed for {c.get('identifier')}: {errs}")
+            continue
+        stats["validated_ok"] += 1
+
+        try:
+            result = await upsert_canonical(collection, source)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["failure_details"].append(
+                f"{c.get('identifier')}: upsert: {type(exc).__name__}: {exc}"
+            )
+            log(f"[dryad] upsert failed for {c.get('identifier')}: {exc}")
+            continue
+
+        if result.get("action") == "invalid":
+            stats["validation_failed"] += 1
+            stats["validation_errors"].append(
+                f"{c.get('identifier')}: {result.get('errors', [])[:2]}"
+            )
+            log(f"[dryad] canonical validation failed for {c.get('identifier')}")
+            continue
+
+        if result["action"] == "inserted":
+            stats["inserted"] += 1
+        else:
+            stats["merged"] += 1
+            via = result.get("matchedVia") or "unknown"
+            stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+        ambiguous = result.get("ambiguousCandidates") or []
+        if ambiguous:
+            stats["ambiguous_candidates"] += len(ambiguous)
+            if len(stats["ambiguous_sample"]) < 10:
+                stats["ambiguous_sample"].append(
+                    {
+                        "source": c.get("identifier"),
+                        "candidates": [
+                            cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                        ],
+                    }
+                )
+
+    stats["asset_calls"] = 0  # hard guarantee: no file/asset downloads
+    stats["api_calls"] = 0    # census artifact is authoritative — no API calls
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[dryad] done: input={stats['input']} high={stats['high_confidence']} "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['api_calls']} (asset_calls={stats['asset_calls']}) "
         f"elapsed={stats['elapsed_s']}s"
     )
     return stats

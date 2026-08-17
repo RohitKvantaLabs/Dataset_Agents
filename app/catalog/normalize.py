@@ -1935,3 +1935,229 @@ def build_hcp_source_record(study: dict) -> dict:
         },
     }
     return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dryad catalog normalization (implementation + dry-run 2026-08-17)
+#
+# Source of truth: the validated census artifact
+# ``trace_artifacts/dryad_census_20260817/dryad_candidates.jsonl`` — each line
+# is ONE Dryad dataset (the list API returns one record per dataset, latest
+# version only; versions are NEVER separate canonical records).
+#
+# Identity (locked):
+#   sourceDatasetId = "dryad:<numeric-id>"   (Dryad package id)
+#   sourceUrl       = https://datadryad.org/dataset/doi:10.5061/dryad.<slug>
+#                     (the dataset landing page — verified live, HTTP 200)
+#   DOI             = the Dryad dataset DOI (10.5061/dryad.*) — the CANONICAL
+#                     dataset identity (DOI priority 1 in the generic
+#                     resolver). Reused verbatim from the census artifact's
+#                     ``identifier``, never rediscovered.
+#   The related ARTICLE DOI (``relatedWorks`` relationship=primary_article)
+#   stays relationship metadata under ``publication.relatedIdentifiers`` — it
+#   is NEVER the canonical DOI and never drives identity.
+#
+# Version handling: one list record = one dataset-level entity.
+# versionNumber/versionStatus are preserved under rawMetadata.dryad and
+# snapshot — never separate canonical records.
+#
+# ZERO asset/file calls: only census metadata is used (no downloads).
+# ─────────────────────────────────────────────────────────────────────────────
+
+DRYAD_REPOSITORY = "dryad"
+
+# Dryad dataset landing page — the actual dataset URL (never the Dryad
+# homepage, a journal-article URL, or an individual file URL).
+DRYAD_DATASET_URL = "https://datadryad.org/dataset/"
+
+# Census classification label for the validated HIGH-confidence ingestion set.
+DRYAD_HIGH_CONFIDENCE = "H"
+
+
+def _dryad_doi(identifier) -> str | None:
+    """Census artifact identifier is ``doi:10.5061/dryad.gc72v`` → DOI."""
+    if not identifier:
+        return None
+    raw = str(identifier).strip()
+    if raw.lower().startswith("doi:"):
+        raw = raw[4:].strip()
+    return normalize_doi(raw)
+
+
+def _dryad_related_identifiers(record: dict) -> list[dict]:
+    """Related works preserved verbatim as relationship metadata.
+
+    The primary-article DOI lives here (relationship metadata only) — it must
+    never become the canonical dataset DOI.
+    """
+    out: list[dict] = []
+    for rw in record.get("relatedWorks") or []:
+        if isinstance(rw, dict) and rw.get("identifier"):
+            out.append(dict(rw))
+    return out
+
+
+def _dryad_article_doi(record: dict) -> str | None:
+    """The primary-article DOI — relationship metadata, never identity."""
+    for rw in record.get("relatedWorks") or []:
+        if isinstance(rw, dict) and rw.get("relationship") == "primary_article":
+            return normalize_doi(str(rw.get("identifier") or ""))
+    return None
+
+
+def _dryad_funders(record: dict) -> list[dict]:
+    """Census funders are ``[{organization, awardNumber}]`` — preserved."""
+    out: list[dict] = []
+    for f in record.get("funders") or []:
+        if isinstance(f, dict) and (f.get("organization") or f.get("awardNumber")):
+            out.append(
+                {
+                    "organization": f.get("organization"),
+                    "awardNumber": f.get("awardNumber"),
+                }
+            )
+    return out
+
+
+def _dryad_authors(record: dict) -> tuple[list[str], list[dict]]:
+    """Split census author blocks (firstName/lastName/orcid/affiliation)
+    into (authors, contributors)."""
+    authors: list[str] = []
+    contributors: list[dict] = []
+    for a in record.get("authors") or []:
+        if not isinstance(a, dict):
+            continue
+        name = " ".join(
+            p for p in (a.get("firstName"), a.get("lastName"))
+            if isinstance(p, str) and p.strip()
+        ).strip()
+        if not name:
+            continue
+        if name not in authors:
+            authors.append(name)
+        if a.get("orcid") or a.get("affiliation"):
+            contributors.append(
+                {
+                    "name": name,
+                    "orcid": a.get("orcid"),
+                    "affiliation": a.get("affiliation"),
+                }
+            )
+    return authors, contributors
+
+
+def build_dryad_source_record(record: dict) -> dict:
+    """Map one census-artifact Dryad dataset → per-source canonical record.
+
+    ``record`` is one line of dryad_candidates.jsonl (metadata only — never
+    a file payload). Pure and deterministic; no fabrication.
+    """
+    ds_id = str(record.get("id") or "").strip()
+    identifier = record.get("identifier") or ""
+    doi = _dryad_doi(identifier)
+    source_url = f"{DRYAD_DATASET_URL}{identifier}" if identifier else None
+
+    authors, contributors = _dryad_authors(record)
+
+    storage_size = record.get("storageSize")
+    try:
+        storage_size = int(storage_size) if storage_size is not None else None
+    except (TypeError, ValueError):
+        storage_size = None
+
+    publish_date = _as_str(record.get("publicationDate"))
+    last_mod = _as_str(record.get("lastModificationDate"))
+    license_raw = _as_str(record.get("license"))
+
+    # ── Derived NeuroSearch fields (documented deterministic rules) ─────────
+    derived = {
+        "participantCount": None,  # no structured participant count on Dryad
+        "ageGroup": None,          # no structured ages on Dryad
+        "sizeLabel": size_label(storage_size),
+        "publicationYear": derive_publication_year(publish_date),
+        "availability": availability_for(
+            DRYAD_REPOSITORY, record.get("visibility") == "public"
+        ),
+    }
+
+    source = {
+        # provenance / identity
+        "repository": DRYAD_REPOSITORY,
+        "sourceDatasetId": f"dryad:{ds_id}" if ds_id else None,
+        "sourceUrl": source_url,
+        "doi": doi,  # canonical Dryad dataset DOI (identity)
+        # core
+        "title": _as_str(record.get("title")),
+        "description": _as_str(record.get("abstract")),
+        "readme": None,
+        "license": license_raw,             # raw — never destroyed
+        "licenseNormalized": normalize_license(license_raw),
+        "datasetType": None,                # no reliable Dryad dataset-type field
+        "availability": derived["availability"],
+        "lastUpdated": _parse_timestamp(last_mod),
+        "createdAt": None,
+        "publishDate": publish_date,
+        "authors": authors,
+        "contributors": contributors,
+        # scientific metadata — Dryad exposes no structured modality/species/
+        # disease/anatomy/ages; never invented from census keyword signals
+        # (those signals stay in rawMetadata.dryad for audit).
+        "modality": [],
+        "modalityRaw": [],
+        "species": None,
+        "speciesRaw": None,
+        "disease": None,
+        "brainRegions": None,
+        "ages": None,
+        "ageGroup": None,
+        "participantCount": None,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": _str_list(record.get("keywords")),
+        "analysisMethods": None,
+        # snapshot / version information (one list record = one dataset)
+        "snapshot": {
+            "dryadId": ds_id,
+            "versionNumber": record.get("versionNumber"),
+            "versionStatus": record.get("versionStatus"),
+            "curationStatus": record.get("curationStatus"),
+            "visibility": record.get("visibility"),
+            "fieldOfScience": record.get("fieldOfScience"),
+            "storageSize": storage_size,
+            "metrics": record.get("metrics"),
+            "relatedPublicationISSN": record.get("relatedPublicationISSN"),
+            "censusClassification": record.get("classification"),
+        },
+        "datasetSizeBytes": storage_size,
+        # publication information — the ARTICLE DOI is relationship metadata,
+        # quarantined from identity (never the canonical DOI).
+        "publication": {
+            "publishDate": publish_date,
+            "articleDoi": _dryad_article_doi(record),
+            "relatedIdentifiers": _dryad_related_identifiers(record),
+            "funding": _dryad_funders(record),
+            "relatedPublicationISSN": record.get("relatedPublicationISSN"),
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": DRYAD_REPOSITORY,
+            "sourceApi": "datadryad.org/api/v2 (census artifact 2026-08-17)",
+            "retrievedAt": _utcnow(),
+            "direct": [
+                "title", "description", "authors", "keywords", "license",
+                "publishDate", "storageSize",
+            ],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched census-artifact record — preserved verbatim (spec §11)
+        "rawMetadata": record,
+    }
+    return source
