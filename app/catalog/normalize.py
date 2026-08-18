@@ -2600,3 +2600,273 @@ def build_ukbiobank_source_record(record: dict) -> dict:
         "rawMetadata": record,
     }
     return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EBRAINS ingestion normalization (implementation + dry-run 2026-08-18)
+#
+# Dataset unit = ONE approved EBRAINS Dataset (a stable Dataset product).
+# DatasetVersion / File / FileBundle / Model / Software / WebService /
+# Publication are NOT datasets — they are never separate canonical records.
+# A multi-version EBRAINS Dataset (212 parents with n_total_versions > 1)
+# remains ONE canonical product; the census version info (version_ids,
+# n_versions, first/latest release) is preserved under snapshot + rawMetadata.
+#
+# Approved input = the 1,138 neuroscience records of the validated EBRAINS
+# census (trace_artifacts/ebrains_census_20260818/ebrains_candidates.jsonl,
+# cross-checked against ebrains_census.json). A hard gate requires EXACTLY
+# 1,138 records and REFUSES any record classified non-neuroscience (NON) — the
+# two non-neuro products of the raw census are never part of the approved set.
+#
+# Identity:
+#   sourceDatasetId = "ebrains:<dataset_id>"  (the stable EBRAINS Dataset ID —
+#                   NEVER the DatasetVersion ID, even for single-version
+#                   products whose version_id happens to equal the dataset_id).
+#   sourceKeys      = ["ebrains:ebrains:<dataset_id>"]
+#   sourceUrl       = the census url VERBATIM — the real public EBRAINS KG
+#                   instance page (search.kg.ebrains.eu/instances/<dataset_id>).
+#                   Verified UNIQUE per Dataset (1138/1138 distinct), so it is a
+#                   genuine per-dataset locator and EBRAINS is deliberately NOT
+#                   in SHARED_SOURCE_URL_REPOSITORIES (unlike ADNI/UKB whose
+#                   URLs are shared documentation pages).
+#   DOI             = the EBRAINS-minted primary_doi (10.25493/...) IS a
+#                   verified dataset-level DOI → canonical doi. External-repo
+#                   DOIs (external_doi=True) are NEVER canonical identity: the
+#                   15 related/distinct external resources (Zenodo, G-Node,
+#                   NITRC, Mendeley, figshare, Radboud), the 4 publication DOIs
+#                   and the 3 OSF project/container DOIs are preserved as
+#                   relationship/provenance metadata only (publication.articleDoi
+#                   / relatedIdentifiers). The four audited EXACT DANDI/OpenNeuro
+#                   matches flow through the existing generic resolver's
+#                   cross_reference layer (real mirror dataset page derived
+#                   deterministically from the dataset DOI — see
+#                   _ebrains_mirror_reference), never via an EBRAINS-specific
+#                   matcher, and never by overwriting the existing canonical DOI.
+#   cross-references: only the two known dataset-DOI namespaces (DANDI
+#                   10.48324/dandi.<id>, OpenNeuro 10.18112/openneuro.ds<id>)
+#                   produce a mirror reference — exactly the 4 A-class matches
+#                   of the identity audit. All other external DOIs yield none.
+#
+# Canonical field mapping (never inferred from free text):
+#   modality  = strict MODALITY_VOCAB mapping of the census technique +
+#               experimental_approach tokens (e.g. "functional magnetic
+#               resonance imaging" → fmri, "diffusion-weighted imaging" → dti,
+#               "electroencephalography" → eeg). Unknown tokens stay under
+#               modalityRaw, never coerced into the canonical list.
+#   species   = census species field via normalize_species (known values map,
+#               unknown real values preserved lowercase, e.g. "homo sapiens").
+#   keywords  = census semicolon keyword string → list (preserved).
+#   availability = None: EBRAINS accessibility is per-record ("free access",
+#               "controlled access", "restricted access", "under embargo") and
+#               the canonical schema deliberately leaves ebrains unset (no
+#               guessing) — the verbatim accessibility value is preserved under
+#               snapshot.accessibility and rawMetadata.ebrains.
+#   participantCount/ages/ageGroup/disease/brainRegions/studyType/etc. = None:
+#               the census carries no such structured dataset-level values.
+#   authors/contributors = []: census lists no authors — never invented.
+#
+# ZERO asset/file crawling — metadata only (api_calls and asset_calls stay 0).
+# ─────────────────────────────────────────────────────────────────────────────
+
+EBRAINS_REPOSITORY = "ebrains"
+
+# The approved EBRAINS census set is exactly 1,138 neuroscience records
+# (1,140 raw census − 2 non-neuroscience). Hard gate: input != 1,138 (or any
+# NON-classified record) refuses the entire run before any write.
+EBRAINS_CENSUS_EXPECTED = 1138
+
+# Real DANDI/OpenNeuro dataset-landing DOIs → mirror dataset page (VERIFIED
+# exact matches, identity audit 2026-08-18, A-class). The DANDI dataset DOI
+# namespace is 10.48324/dandi.<id>/..., OpenNeuro is
+# 10.18112/openneuro.ds<id>... — the dataset id is encoded in the DOI itself,
+# so the real mirror page URL is derived deterministically (never guessed).
+_EBRAINS_MIRROR_DOI_PATTERNS: tuple[tuple[re.Pattern, str, str], ...] = (
+    (
+        re.compile(r"^10\.48324/dandi\.(\d+)"),
+        "dandi",
+        "https://dandiarchive.org/dandiset/{0}",
+    ),
+    (
+        re.compile(r"^10\.18112/openneuro\.(ds\d+)"),
+        "openneuro",
+        "https://openneuro.org/datasets/{0}",
+    ),
+)
+
+
+def _split_semicolons(value) -> list[str]:
+    """Census semicolon-separated string → ordered deduped list (real tokens)."""
+    if not value:
+        return []
+    out: list[str] = []
+    for part in str(value).split(";"):
+        token = part.strip()
+        if token and token not in out:
+            out.append(token)
+    return out
+
+
+def _ebrains_modality(record: dict) -> tuple[list[str], list[str]]:
+    """Strict canonical modality from census technique/experimental_approach
+    tokens. Only MODALITY_VOCAB tokens map to canonical labels; the full raw
+    token list stays under modalityRaw (never coerced)."""
+    tokens = _split_semicolons(record.get("technique")) + _split_semicolons(
+        record.get("experimental_approach")
+    )
+    canonical: list[str] = []
+    for tok in tokens:
+        label = _MODALITY_LABEL.get(tok.lower())
+        if label and label not in canonical:
+            canonical.append(label)
+    return canonical, tokens
+
+
+def _ebrains_mirror_reference(doi: str | None) -> str | None:
+    """Real DANDI/OpenNeuro dataset landing page for a VERIFIED exact-match DOI.
+
+    Only the two known dataset-DOI namespaces qualify (the DOI deterministically
+    encodes the repository dataset id — audited A-class matches). Returns None
+    for every other external DOI: no URL is ever fabricated or guessed.
+    """
+    if not doi:
+        return None
+    d = doi.strip().lower()
+    for pattern, _repo, url_tpl in _EBRAINS_MIRROR_DOI_PATTERNS:
+        m = pattern.match(d)
+        if m:
+            return url_tpl.format(m.group(1))
+    return None
+
+
+def build_ebrains_source_record(record: dict) -> dict:
+    """Map one EBRAINS census-artifact record → per-source canonical record.
+
+    ``record`` is one line of ebrains_candidates.jsonl (metadata only — never
+    a file payload, no downloads, no participant-level data). sourceUrl is the
+    census url VERBATIM (the real EBRAINS KG instance page). Identity flows
+    through the deterministic repository:sourceDatasetId/sourceKeys. Pure and
+    deterministic; no fabrication of missing values.
+    """
+    dataset_id = _as_str(record.get("dataset_id"))
+    ds_id = f"{EBRAINS_REPOSITORY}:{dataset_id}" if dataset_id else None
+    source_url = _as_str(record.get("url"))
+    primary_doi = normalize_doi(record.get("doi") or record.get("primary_doi"))
+    is_external = bool(record.get("external_doi"))
+    mirror_url = _ebrains_mirror_reference(record.get("doi") or record.get("primary_doi")) if is_external else None
+    first_release = _as_str(record.get("first_release"))
+    latest_release = _as_str(record.get("latest_release"))
+    accessibility = _as_str(record.get("accessibility"))
+    version_ids = _split_semicolons(record.get("version_ids"))
+    species_raw = _split_semicolons(record.get("species"))
+    modality, modality_raw = _ebrains_modality(record)
+
+    # ── Derived NeuroSearch fields (documented deterministic rules) ─────────
+    derived = {
+        "participantCount": None,          # census records no participant counts
+        "ageGroup": None,                  # no structured ages on the census
+        "sizeLabel": None,                 # census carries no dataset size
+        "publicationYear": derive_publication_year(first_release),
+        "availability": None,              # EBRAINS access is per-record (no guessing)
+    }
+
+    source = {
+        # provenance / identity
+        "repository": EBRAINS_REPOSITORY,
+        "sourceDatasetId": ds_id,
+        "sourceUrl": source_url,  # census url verbatim — the real EBRAINS KG page
+        "doi": primary_doi if not is_external else None,  # external DOIs never canonical
+        # core
+        "title": _as_str(record.get("title")),
+        "description": None,               # census carries no description field
+        "readme": None,
+        "license": None,                   # census carries no dataset-level license
+        "licenseNormalized": None,
+        "datasetType": None,               # census dataset_class kept in snapshot
+        "availability": derived["availability"],
+        "lastUpdated": _parse_timestamp(latest_release),
+        "createdAt": None,
+        "publishDate": first_release,
+        "authors": [],                     # census lists no authors — never invented
+        "contributors": [],
+        # scientific metadata — strict/circumscribed (see section note)
+        "modality": modality,
+        "modalityRaw": modality_raw,
+        "species": normalize_species(species_raw) or None,
+        "speciesRaw": species_raw,
+        "disease": None,
+        "brainRegions": None,
+        "ages": None,
+        "ageGroup": None,
+        "participantCount": None,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": _split_semicolons(record.get("keywords")),
+        "analysisMethods": None,
+        # snapshot / version information — one census record = one Dataset
+        # product; versions are metadata on the parent, never separate datasets
+        "snapshot": {
+            "datasetId": dataset_id,
+            "category": record.get("category") or record.get("dataset_class"),
+            "confidence": record.get("confidence"),
+            "neuroRelevance": record.get("neuro_relevance"),
+            "multiVersion": bool(record.get("multi_version")),
+            "nVersions": record.get("n_versions") or record.get("n_total_versions"),
+            "nIndexedVersions": record.get("n_indexed_versions"),
+            "versionIds": version_ids,
+            "firstRelease": first_release,
+            "latestRelease": latest_release,
+            "accessibility": accessibility,
+            "technique": _split_semicolons(record.get("technique")),
+            "experimentalApproach": _split_semicolons(record.get("experimental_approach")),
+            "externalDoi": bool(is_external),
+            "primaryDoi": primary_doi,
+            "datasetUnitRationale": (
+                "Dataset unit = ONE EBRAINS Dataset product. DatasetVersion / "
+                "File / FileBundle / Model / Software / WebService / Publication "
+                "are NEVER separate canonical records; version info is preserved "
+                "under snapshot + rawMetadata.ebrains."
+            ),
+        },
+        "datasetSizeBytes": None,
+        # the real EBRAINS KG instance page — verbatim census URL
+        "documentationUrl": source_url,
+        # publication information — external DOIs are relationship metadata
+        # ONLY, quarantined from identity (canonical doi stays null). The four
+        # audited exact matches also carry the real DANDI/OpenNeuro mirror page
+        # so the generic resolver's cross_reference layer resolves them.
+        "publication": {
+            "publishDate": first_release,
+            "articleDoi": primary_doi if is_external else None,
+            "relatedIdentifiers": (
+                [{"identifier": primary_doi}] if is_external and primary_doi else []
+            ),
+            "referencesAndLinks": [mirror_url] if mirror_url else [],
+            "funding": [],
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": EBRAINS_REPOSITORY,
+            "sourceApi": "search.kg.ebrains.eu census artifact 2026-08-18",
+            "retrievedAt": _utcnow(),
+            "direct": [
+                "dataset_id", "title", "category", "dataset_class", "confidence",
+                "neuro_relevance", "doi", "primary_doi", "external_doi",
+                "multi_version", "n_versions", "n_total_versions",
+                "n_indexed_versions", "first_release", "latest_release",
+                "accessibility", "species", "technique", "experimental_approach",
+                "keywords", "version_ids", "url",
+            ],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched EBRAINS census-artifact record — preserved verbatim (spec §11)
+        "rawMetadata": record,
+    }
+    return source

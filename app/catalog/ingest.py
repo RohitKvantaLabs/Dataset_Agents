@@ -35,11 +35,13 @@ from app.catalog.normalize import (
     HCP_DATA_RELEASES_URL,
     ADNI_CENSUS_EXPECTED,
     UKB_CENSUS_EXPECTED,
+    EBRAINS_CENSUS_EXPECTED,
     DRYAD_HIGH_CONFIDENCE,
     build_adni_source_record,
     build_allen_source_record,
     build_dandi_source_record,
     build_dryad_source_record,
+    build_ebrains_source_record,
     build_hcp_source_record,
     build_nemar_source_record,
     build_neuromorpho_source_record,
@@ -2439,6 +2441,266 @@ async def run_ukbiobank_ingestion(
     stats["finished_at"] = _utcnow()
     log(
         f"[ukbiobank] done: input={stats['input']} (expected={stats['expected']}) "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
+
+
+# EBRAINS ingestion (implementation + dry-run 2026-08-18)
+#
+# Flow:
+#    1. Input — the AUTHORITATIVE, validated EBRAINS census artifact
+#       (trace_artifacts/ebrains_census_20260818/ebrains_candidates.jsonl,
+#       cross-checked against ebrains_census.json). The hard gate REFUSES the
+#       entire run unless the input is EXACTLY 1,138 approved neuroscience
+#       records (the raw census holds 1,140 — the two non-neuroscience
+#       products are NEVER part of the approved set) and every record carries
+#       a dataset_id. The adapter never silently expands or trims the set.
+#    2. Normalize each record via build_ebrains_source_record().
+#    3. The existing generic pipeline: validate → resolve_identity →
+#       upsert_canonical() (insert or merge into the existing canonical
+#       record). No new identity/dedup/persistence logic is introduced.
+#
+# Dataset unit = ONE EBRAINS Dataset product (see normalize.py). The four
+# audited EXACT DANDI/OpenNeuro matches resolve through the generic
+# cross_reference layer of the resolver (real mirror-page references in
+# publication.referencesAndLinks) — they merge into the existing canonical
+# record; every other approved record inserts as a new EBRAINS canonical
+# record. External-repository DOIs (Zenodo, G-Node, OSF, NITRC, Mendeley,
+# figshare, Radboud, publication DOIs) are preserved as relationship/
+# provenance metadata ONLY — no records are ever created for the external
+# repositories themselves.
+#
+# Metadata-only: the census artifact already contains every field needed
+# (dataset id, title, category, confidence, neuro relevance, DOI, version
+# information, release dates, accessibility, species, technique, experimental
+# approach, keywords, version ids, URL). ZERO EBRAINS API calls and ZERO
+# asset/file downloads — ``api_calls`` and ``asset_calls`` stay 0. No
+# participant data, no files, no version-level products. Running this
+# function against a LIVE collection is the only write path; a read-only
+# dry-run resolution is provided separately (trace_tools/ebrains_dryrun.py)
+# and must be executed before any live run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _ebrains_identity_keys(record: dict) -> list[str]:
+    """Deterministic candidate-identity keys for duplicate protection.
+
+    Mirrors what the generic resolver will use: the EBRAINS source key
+    (repository:sourceDatasetId = "ebrains:ebrains:<dataset_id>"). Returns []
+    when a record has no usable dataset_id (caught as a normalization failure
+    downstream).
+    """
+    dataset_id = str(record.get("dataset_id") or "").strip()
+    if not dataset_id:
+        return []
+    return [f"ebrains:ebrains:{dataset_id}"]
+
+
+async def run_ebrains_ingestion(
+    db,
+    *,
+    records: list[dict],
+    log=print,
+) -> dict:
+    """Ingest the validated EBRAINS census set (metadata only).
+
+    ``records`` is the authoritative ingestion list — each dict is one
+    approved EBRAINS census candidate (ebrains_candidates.jsonl). A hard gate
+    refuses the run unless there are EXACTLY ``EBRAINS_CENSUS_EXPECTED``
+    records (1,138), every record carries a dataset_id, and NO record is
+    classified non-neuroscience — so no run can silently process a partial,
+    bloated, or non-neuro input.
+
+    Never requests EBRAINS API endpoints or dataset files: the census
+    artifact already carries all metadata needed for canonical insertion.
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "ebrains",
+        "input": len(records),
+        "expected": EBRAINS_CENSUS_EXPECTED,
+        "gate_failed": False,
+        "gate_reason": None,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "duplicate_source_identities": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_calls": 0,       # census artifact is authoritative — no API calls
+        "asset_calls": 0,     # hard guarantee: no file/asset downloads
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+    }
+
+    t0 = time.monotonic()
+
+    # ── 1) Exact-count gate — EXACTLY EBRAINS_CENSUS_EXPECTED records. ────────
+    if len(records) != EBRAINS_CENSUS_EXPECTED:
+        stats["gate_failed"] = True
+        stats["gate_reason"] = (
+            f"input has {len(records)} records; the approved EBRAINS census "
+            f"set is exactly {EBRAINS_CENSUS_EXPECTED} — NOT writing anything"
+        )
+        log(f"[ebrains] *** GATE FAILED: {stats['gate_reason']} ***")
+        stats["finished_at"] = _utcnow()
+        stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    # 2) Completeness gates — every record needs a dataset_id, and no record
+    #    may be a non-neuroscience product (the raw census's two NON records
+    #    are deliberately never part of the approved set). Malformed entries
+    #    (non-dict) are treated as missing identity so a corrupted input
+    #    refuses the ENTIRE run, never a partial write.
+    missing_identity: list[dict] = []
+    for record in records:
+        dataset_id = (
+            str(record.get("dataset_id") or "").strip()
+            if isinstance(record, dict)
+            else ""
+        )
+        if not dataset_id:
+            missing_identity.append(
+                {
+                    "dataset_name": (
+                        record.get("title") if isinstance(record, dict) else None
+                    ),
+                    "reason": "missing dataset_id",
+                }
+            )
+    if missing_identity:
+        stats["gate_failed"] = True
+        stats["gate_reason"] = (
+            f"{len(missing_identity)} records lack a dataset_id "
+            f"(e.g. {missing_identity[0].get('dataset_name')}) — NOT writing anything"
+        )
+        log(f"[ebrains] *** GATE FAILED: {stats['gate_reason']} ***")
+        stats["finished_at"] = _utcnow()
+        stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    non_neuro = [
+        str(record.get("title") or "")
+        for record in records
+        if (record.get("neuro_relevance") == "non_neuroscience")
+        or (str(record.get("category") or record.get("dataset_class")).strip().upper() == "NON")
+    ]
+    if non_neuro:
+        stats["gate_failed"] = True
+        stats["gate_reason"] = (
+            f"{len(non_neuro)} non-neuroscience record(s) present (e.g. "
+            f"{non_neuro[0]}) — the approved EBRAINS census set is "
+            f"neuroscience-only, NOT writing anything"
+        )
+        log(f"[ebrains] *** GATE FAILED: {stats['gate_reason']} ***")
+        stats["finished_at"] = _utcnow()
+        stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    # ── 3) Duplicate candidate protection (same dataset identity twice). ──────
+    # The census artifact is deduplicated (1138/1138 unique dataset_id AND
+    # unique source URL), so ANY repeated identity key in the input is a
+    # genuine duplicate — the generic resolver would merge them, but the
+    # adapter detects and reports it up front.
+    seen: dict[str, str] = {}
+    for record in records:
+        for key in _ebrains_identity_keys(record):
+            prev = seen.get(key)
+            if prev is not None:
+                stats["duplicate_source_identities"].append(
+                    {
+                        "identity": key,
+                        "first": prev,
+                        "second": str(record.get("dataset_id") or ""),
+                    }
+                )
+            else:
+                seen[key] = str(record.get("dataset_id") or "")
+
+    # ── 4) Normalize → validate → generic upsert (insert or merge). ──────────
+    # EBRAINS sourceUrl is the census url VERBATIM (the real EBRAINS KG
+    # instance page, unique per dataset — so EBRAINS is NOT in
+    # SHARED_SOURCE_URL_REPOSITORIES). Product identity flows through the
+    # deterministic repo:sourceDatasetId/sourceKey; the four audited exact
+    # DANDI/OpenNeuro matches are found by the generic resolver's
+    # cross_reference layer and merge into the existing canonical record.
+    for record in records:
+        dataset_id = str(record.get("dataset_id") or "").strip()
+        try:
+            source = build_ebrains_source_record(record)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["failure_details"].append(
+                f"{dataset_id}: normalize: {type(exc).__name__}: {exc}"
+            )
+            log(f"[ebrains] normalize failed for {dataset_id}: {exc}")
+            continue
+        stats["normalized"] += 1
+
+        errs = _validate_source(source)
+        if errs:
+            stats["validation_failed"] += 1
+            stats["validation_errors"].append(f"{dataset_id}: {errs[0]}")
+            log(f"[ebrains] validation failed for {dataset_id}: {errs}")
+            continue
+        stats["validated_ok"] += 1
+
+        try:
+            result = await upsert_canonical(collection, source)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["failure_details"].append(
+                f"{dataset_id}: upsert: {type(exc).__name__}: {exc}"
+            )
+            log(f"[ebrains] upsert failed for {dataset_id}: {exc}")
+            continue
+
+        if result.get("action") == "invalid":
+            stats["validation_failed"] += 1
+            stats["validation_errors"].append(
+                f"{dataset_id}: {result.get('errors', [])[:2]}"
+            )
+            log(f"[ebrains] canonical validation failed for {dataset_id}")
+            continue
+
+        if result["action"] == "inserted":
+            stats["inserted"] += 1
+        else:
+            stats["merged"] += 1
+            via = result.get("matchedVia") or "unknown"
+            stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+        ambiguous = result.get("ambiguousCandidates") or []
+        if ambiguous:
+            stats["ambiguous_candidates"] += len(ambiguous)
+            if len(stats["ambiguous_sample"]) < 10:
+                stats["ambiguous_sample"].append(
+                    {
+                        "source": dataset_id,
+                        "candidates": [
+                            cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                        ],
+                    }
+                )
+
+    stats["asset_calls"] = 0  # hard guarantee: no file/asset downloads
+    stats["api_calls"] = 0    # census artifact is authoritative — no API calls
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[ebrains] done: input={stats['input']} (expected={stats['expected']}) "
         f"normalized={stats['normalized']} inserted={stats['inserted']} "
         f"merged={stats['merged']} failed={stats['failed']} "
         f"api_calls={stats['api_calls']} (asset_calls={stats['asset_calls']}) "
