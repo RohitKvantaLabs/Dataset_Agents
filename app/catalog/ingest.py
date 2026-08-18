@@ -34,6 +34,7 @@ from app.catalog.normalize import (
     HCP_PUBLICATIONS_URL,
     HCP_DATA_RELEASES_URL,
     ADNI_CENSUS_EXPECTED,
+    UKB_CENSUS_EXPECTED,
     DRYAD_HIGH_CONFIDENCE,
     build_adni_source_record,
     build_allen_source_record,
@@ -43,6 +44,7 @@ from app.catalog.normalize import (
     build_nemar_source_record,
     build_neuromorpho_source_record,
     build_source_record,
+    build_ukbiobank_source_record,
     group_neuromorpho_neurons,
     hcp_index_card_slugs,
     hcp_index_slugs,
@@ -2209,6 +2211,234 @@ async def run_adni_ingestion(
     stats["finished_at"] = _utcnow()
     log(
         f"[adni] done: input={stats['input']} (expected={stats['expected']}) "
+        f"normalized={stats['normalized']} inserted={stats['inserted']} "
+        f"merged={stats['merged']} failed={stats['failed']} "
+        f"api_calls={stats['api_calls']} (asset_calls={stats['asset_calls']}) "
+        f"elapsed={stats['elapsed_s']}s"
+    )
+    return stats
+
+
+# UK Biobank ingestion (implementation + dry-run 2026-08-17)
+#
+# Flow:
+#    1. Input — the AUTHORITATIVE UK Biobank census artifacts
+#       (trace_artifacts/ukbiobank_census_20260817/ukbiobank_census.json →
+#       datasets_approved[] AND ukbiobank_candidates.jsonl). The hard gate
+#       REFUSES the entire run unless the input is EXACTLY 21 records — the
+#       adapter never silently expands or trims the approved set. Records
+#       must also carry a stable_identifier.
+#    2. Normalize each record via build_ukbiobank_source_record().
+#    3. The existing generic pipeline: validate → resolve_identity →
+#       upsert_canonical() (insert or merge into the existing canonical
+#       record). No new identity/dedup/persistence logic is introduced.
+#
+# Metadata-only: the census artifact already contains every field needed
+# (stable identifier, name, description, category + category IDs, modality,
+# child Data-Field IDs and counts, participant count, access level, version/
+# release information, dataset-unit rationale, classification). ZERO UK
+# Biobank API calls and ZERO asset/file downloads — ``api_calls`` and
+# ``asset_calls`` stay 0. No participant data, no bulk/image files, no
+# UKB-RAP access. The Returns catalogue (158 neuroscience-related returned
+# datasets) is deliberately NEVER ingested — returned datasets stay excluded.
+# Running this function against a LIVE collection is the only write path; a
+# read-only dry-run resolution is provided separately
+# (trace_tools/ukbiobank_dryrun.py) and must be executed before any live run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _ukbiobank_identity_keys(record: dict) -> list[str]:
+    """Deterministic candidate-identity keys for duplicate protection.
+
+    Mirrors what the generic resolver will use: the UK Biobank source key
+    (repository:sourceDatasetId = "ukbiobank:ukbiobank:<stable_identifier>").
+    Returns [] when a record has no usable stable identifier (caught as a
+    normalization failure downstream).
+    """
+    stable_id = str(record.get("stable_identifier") or "").strip()
+    if not stable_id:
+        return []
+    return [f"ukbiobank:ukbiobank:{stable_id}"]
+
+
+async def run_ukbiobank_ingestion(
+    db,
+    *,
+    records: list[dict],
+    log=print,
+) -> dict:
+    """Ingest the validated UK Biobank census set (metadata only).
+
+    ``records`` is the authoritative ingestion list — each dict is one
+    approved UK Biobank census candidate (ukbiobank_candidates.jsonl). A hard
+    gate refuses the run unless there are EXACTLY ``UKB_CENSUS_EXPECTED``
+    records (21) and every record carries a stable_identifier, so no run can
+    silently process a partial or bloated input.
+
+    Never requests UK Biobank API endpoints, participant data or dataset
+    files: the census artifact already carries all metadata needed for
+    canonical insertion.
+    """
+    collection = get_collection(db)
+    stats: dict = {
+        "collection": CATALOG_COLLECTION,
+        "repository": "ukbiobank",
+        "input": len(records),
+        "expected": UKB_CENSUS_EXPECTED,
+        "gate_failed": False,
+        "gate_reason": None,
+        "normalized": 0,
+        "validated_ok": 0,
+        "validation_failed": 0,
+        "validation_errors": [],
+        "duplicate_source_identities": [],
+        "inserted": 0,
+        "merged": 0,
+        "matched_via": {},
+        "failed": 0,
+        "failure_details": [],
+        "api_calls": 0,       # census artifact is authoritative — no API calls
+        "asset_calls": 0,     # hard guarantee: no file/asset downloads
+        "ambiguous_candidates": 0,
+        "ambiguous_sample": [],
+        "started_at": _utcnow(),
+        "finished_at": None,
+        "elapsed_s": None,
+    }
+
+    t0 = time.monotonic()
+
+    # ── 1) Exact-count gate — EXACTLY UKB_CENSUS_EXPECTED records. ───────────
+    if len(records) != UKB_CENSUS_EXPECTED:
+        stats["gate_failed"] = True
+        stats["gate_reason"] = (
+            f"input has {len(records)} records; the approved UK Biobank census "
+            f"set is exactly {UKB_CENSUS_EXPECTED} — NOT writing anything"
+        )
+        log(f"[ukbiobank] *** GATE FAILED: {stats['gate_reason']} ***")
+        stats["finished_at"] = _utcnow()
+        stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    # 2) Identity-completeness gate — every record needs a stable_identifier.
+    #    Malformed entries (non-dict) are treated as missing identity so a
+    #    corrupted input refuses the ENTIRE run, never a partial write.
+    missing_identity: list[dict] = []
+    for record in records:
+        stable = (
+            str(record.get("stable_identifier") or "").strip()
+            if isinstance(record, dict)
+            else ""
+        )
+        if not stable:
+            missing_identity.append(
+                {
+                    "dataset_name": (
+                        record.get("name") if isinstance(record, dict) else None
+                    ),
+                    "reason": "missing stable_identifier",
+                }
+            )
+    if missing_identity:
+        stats["gate_failed"] = True
+        stats["gate_reason"] = (
+            f"{len(missing_identity)} records lack a stable_identifier "
+            f"(e.g. {missing_identity[0].get('dataset_name')}) — NOT writing anything"
+        )
+        log(f"[ukbiobank] *** GATE FAILED: {stats['gate_reason']} ***")
+        stats["finished_at"] = _utcnow()
+        stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    # ── 3) Duplicate candidate protection (same stable identity twice). ──────
+    # The census artifact is deduplicated, so ANY repeated identity key in the
+    # input is a genuine duplicate — the generic resolver would merge them, but
+    # the adapter detects and reports it up front.
+    seen: dict[str, str] = {}
+    for record in records:
+        for key in _ukbiobank_identity_keys(record):
+            prev = seen.get(key)
+            if prev is not None:
+                stats["duplicate_source_identities"].append(
+                    {
+                        "identity": key,
+                        "first": prev,
+                        "second": str(record.get("stable_identifier") or ""),
+                    }
+                )
+            else:
+                seen[key] = str(record.get("stable_identifier") or "")
+
+    # ── 4) Normalize → validate → generic upsert (insert or merge). ──────────
+    # UK Biobank sourceUrl is the census Showcase URL verbatim; product
+    # identity flows through the deterministic repo:sourceDatasetId/sourceKey
+    # (the sourceUrl layer is skipped for UK Biobank — see
+    # SHARED_SOURCE_URL_REPOSITORIES in normalize.py).
+    for record in records:
+        stable_id = str(record.get("stable_identifier") or "").strip()
+        try:
+            source = build_ukbiobank_source_record(record)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["failure_details"].append(
+                f"{stable_id}: normalize: {type(exc).__name__}: {exc}"
+            )
+            log(f"[ukbiobank] normalize failed for {stable_id}: {exc}")
+            continue
+        stats["normalized"] += 1
+
+        errs = _validate_source(source)
+        if errs:
+            stats["validation_failed"] += 1
+            stats["validation_errors"].append(f"{stable_id}: {errs[0]}")
+            log(f"[ukbiobank] validation failed for {stable_id}: {errs}")
+            continue
+        stats["validated_ok"] += 1
+
+        try:
+            result = await upsert_canonical(collection, source)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["failure_details"].append(
+                f"{stable_id}: upsert: {type(exc).__name__}: {exc}"
+            )
+            log(f"[ukbiobank] upsert failed for {stable_id}: {exc}")
+            continue
+
+        if result.get("action") == "invalid":
+            stats["validation_failed"] += 1
+            stats["validation_errors"].append(
+                f"{stable_id}: {result.get('errors', [])[:2]}"
+            )
+            log(f"[ukbiobank] canonical validation failed for {stable_id}")
+            continue
+
+        if result["action"] == "inserted":
+            stats["inserted"] += 1
+        else:
+            stats["merged"] += 1
+            via = result.get("matchedVia") or "unknown"
+            stats["matched_via"][via] = stats["matched_via"].get(via, 0) + 1
+
+        ambiguous = result.get("ambiguousCandidates") or []
+        if ambiguous:
+            stats["ambiguous_candidates"] += len(ambiguous)
+            if len(stats["ambiguous_sample"]) < 10:
+                stats["ambiguous_sample"].append(
+                    {
+                        "source": stable_id,
+                        "candidates": [
+                            cand.get("canonicalDatasetId") for cand in ambiguous[:3]
+                        ],
+                    }
+                )
+
+    stats["asset_calls"] = 0  # hard guarantee: no file/asset downloads
+    stats["api_calls"] = 0    # census artifact is authoritative — no API calls
+    stats["elapsed_s"] = round(time.monotonic() - t0, 3)
+    stats["finished_at"] = _utcnow()
+    log(
+        f"[ukbiobank] done: input={stats['input']} (expected={stats['expected']}) "
         f"normalized={stats['normalized']} inserted={stats['inserted']} "
         f"merged={stats['merged']} failed={stats['failed']} "
         f"api_calls={stats['api_calls']} (asset_calls={stats['asset_calls']}) "

@@ -2237,8 +2237,9 @@ ADNI_REPOSITORY = "adni"
 # identity signal: two products co-located on one official page are distinct
 # datasets, identified by the deterministic repository:sourceDatasetId. Both
 # the canonical-ID derivation (canonical_record_from_source) and the generic
-# identity resolver (dedup.source_identity) honor this set, so ADNI products
-# sharing a URL never merge. Other repositories are untouched.
+# identity resolver (dedup.source_identity) honor this set, so ADNI (and UK
+# Biobank, extended below) products sharing a URL never merge. Other
+# repositories are untouched.
 SHARED_SOURCE_URL_REPOSITORIES: frozenset[str] = frozenset({ADNI_REPOSITORY})
 
 # The ADNI census artifact contains exactly 122 approved dataset-level records.
@@ -2369,6 +2370,233 @@ def build_adni_source_record(record: dict) -> dict:
         # derived summary (explicit direct-vs-derived split, spec §2)
         "derived": derived,
         # untouched ADNI census-artifact record — preserved verbatim (spec §11)
+        "rawMetadata": record,
+    }
+    return source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UK Biobank ingestion normalization (implementation + dry-run 2026-08-17)
+#
+# Dataset unit = ONE approved UK Biobank Showcase category-level scientific
+# product. Approved input = the 21 records of the validated UK Biobank census
+# (trace_artifacts/ukbiobank_census_20260817/ukbiobank_candidates.jsonl,
+# cross-checked against ukbiobank_census.json → datasets_approved). A hard
+# gate requires EXACTLY 21 records — every extra/missing record refuses the
+# run.
+#
+# Identity:
+#   sourceDatasetId = "ukbiobank:<stable_identifier>"  (deterministic; the
+#                   census stable product identifier — the approved 21-product
+#                   scope — IS the repository identity: one named product,
+#                   one canonical record).
+#   sourceKeys      = ["ukbiobank:ukbiobank:<stable_identifier>"]
+#   DOI             = None. UK Biobank products carry NO dataset-level DOI —
+#                   the canonical doi is ALWAYS null. A census publication DOI
+#                   (if ever present) is relationship metadata only
+#                   (source["publication"]["articleDoi"]), never canonical
+#                   identity.
+#   sourceUrl       = the census source_url VERBATIM — always the real public
+#                   UK Biobank Showcase page (biobank.ndph.ox.ac.uk/ukb/
+#                   label.cgi?id=<category>), never a generated path. Category
+#                   pages are SHARED documentation/locator URLs: they describe
+#                   related Showcase metadata, so the URL alone never defines
+#                   identity.
+#   sourceUrlNorm   = None for UK Biobank. The normalized URL is NEVER an
+#                   identity signal — enforced globally via
+#                   SHARED_SOURCE_URL_REPOSITORIES (extended below to include
+#                   ukbiobank): both the canonical-ID derivation
+#                   (canonical_record_from_source) and the generic identity
+#                   resolver (dedup.source_identity) skip the URL layer for
+#                   these repositories and identify products by the
+#                   deterministic repository:sourceDatasetId. The real
+#                   Showcase page is preserved verbatim under
+#                   source["documentationUrl"] and rawMetadata.ukbiobank.
+#
+# Canonical field mapping (never inferred from free text):
+#   modality  = strict map of the EXPLICIT census modality label into the
+#               canonical vocab: MRI → mri. Non-imaging labels (Cognition /
+#               Neuropsychological tests, Psychiatric phenotypes /
+#               questionnaires, Sleep / chronotype questionnaires, Biofluid
+#               biomarkers, Clinical outcomes) stay out of the canonical list
+#               — preserved raw under modalityRaw and snapshot.modalityLabel,
+#               never coerced.
+#   availability = None: UK Biobank is Controlled access (participant-level
+#               data only via UKB-RAP on approved applications) — never
+#               reported as open.
+#   participantCount = the documented census participant count (a real
+#               Showcase number, e.g. 87,637 for T1) — never invented.
+#   ages/ageGroup/disease/brainRegions/species/analysisMethods = None: no
+#               structured dataset-level values exist on the census.
+#   Child Data-Fields: the full child Data-Field ID list, field counts and
+#               bulk/derived breakdowns stay as METADATA on the parent product
+#               (snapshot.childDataFieldIds / fieldCount / bulkFieldCount /
+#               derivedFieldCount + rawMetadata.ukbiobank) — child fields are
+#               variables, NEVER separate canonical datasets.
+#   versions / releases: successive imaging data releases update the same
+#               product (release tranches are NOT separate datasets). The
+#               census version/release information is preserved verbatim under
+#               snapshot.versionReleaseInformation and rawMetadata.ukbiobank.
+#
+# ZERO asset/file crawling — metadata only (api_calls and asset_calls stay 0).
+# ─────────────────────────────────────────────────────────────────────────────
+
+UKB_REPOSITORY = "ukbiobank"
+
+# UK Biobank sourceUrl is a SHARED Showcase category/documentation page, not a
+# per-product locator — extend the shared-URL policy so co-located products
+# never collapse (same rule as ADNI). Identity flows through the
+# deterministic repository:sourceDatasetId.
+SHARED_SOURCE_URL_REPOSITORIES = SHARED_SOURCE_URL_REPOSITORIES | frozenset({UKB_REPOSITORY})
+
+# The UK Biobank census artifact contains exactly 21 approved dataset-level
+# records. This is a hard gate: input != 21 refuses the entire run before any
+# write.
+UKB_CENSUS_EXPECTED = 21
+
+# Strict map of the explicit census modality label → canonical modality vocab.
+# MRI → mri; every other census label is out of the canonical vocab.
+_UKB_MODALITY_MAP: dict[str, str] = {"MRI": "mri"}
+
+
+def _ukbiobank_modality(modality_raw) -> list[str]:
+    """Census modality label → canonical modality vocab (strict map only)."""
+    label = None
+    if isinstance(modality_raw, list) and modality_raw:
+        label = str(modality_raw[0]).strip()
+    elif isinstance(modality_raw, str):
+        label = modality_raw.strip()
+    mapped = _UKB_MODALITY_MAP.get((label or "").upper())
+    return [mapped] if mapped else []
+
+
+def _ukb_int(value) -> int | None:
+    """Best-effort int cast for census numeric metadata (None when absent)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_ukbiobank_source_record(record: dict) -> dict:
+    """Map one UK Biobank census artifact record → per-source canonical record.
+
+    ``record`` is one dict of the approved UK Biobank census candidates
+    (ukbiobank_candidates.jsonl — metadata only, never a file payload).
+    sourceUrl is the census source_url VERBATIM (the real public Showcase
+    page). Category pages are shared documentation URLs and never identity:
+    identity comes from the deterministic sourceDatasetId / sourceKeys (see
+    SHARED_SOURCE_URL_REPOSITORIES). Pure and deterministic; no fabrication
+    of missing values.
+    """
+    stable_id = _as_str(record.get("stable_identifier"))
+    ds_id = f"{UKB_REPOSITORY}:{stable_id}" if stable_id else None
+    doc_url = _as_str(record.get("source_url"))
+    publication_doi = normalize_doi(record.get("publication_doi"))
+    participant_count = _ukb_int(record.get("participant_count"))
+
+    # ── Derived NeuroSearch fields (documented deterministic rules) ─────────
+    derived = {
+        "participantCount": participant_count,  # documented Showcase count
+        "ageGroup": None,          # no structured ages on the census
+        "sizeLabel": None,         # census carries no dataset size
+        "publicationYear": None,   # census carries no publication year
+        "availability": None,      # UKB = Controlled access (UKB-RAP) — never open
+    }
+
+    source = {
+        # provenance / identity
+        "repository": UKB_REPOSITORY,
+        "sourceDatasetId": ds_id,
+        "sourceUrl": doc_url,  # census source_url verbatim — the real Showcase page
+        "doi": None,  # UK Biobank products have NO dataset-level DOI — never fabricated
+        # core
+        "title": _as_str(record.get("name")),
+        "description": _as_str(record.get("description")),
+        "readme": None,
+        "license": None,             # distribution governed by UKB access policy — no dataset-level license
+        "licenseNormalized": None,
+        "datasetType": None,         # census "dataset" classification kept in snapshot
+        "availability": derived["availability"],
+        "lastUpdated": None,         # census carries no update timestamp
+        "createdAt": None,
+        "publishDate": None,
+        "authors": [],               # census lists no authors — never invented
+        "contributors": [],
+        # scientific metadata — strict/circumscribed (see section note)
+        "modality": _ukbiobank_modality(record.get("modality")),
+        "modalityRaw": _str_list([record.get("modality")]) if record.get("modality") else [],
+        "species": None,
+        "speciesRaw": None,
+        "disease": None,
+        "brainRegions": None,
+        "ages": None,
+        "ageGroup": None,
+        "participantCount": participant_count,
+        "subjectIds": None,
+        "studyType": None,
+        "studyDesign": None,
+        "studyDomain": None,
+        "studyLongitudinal": None,
+        "tasks": [],
+        "sessions": [],
+        "trialCount": None,
+        "keywords": [],              # census carries no keyword list
+        "analysisMethods": None,
+        # snapshot / product information — child Data-Fields, field counts,
+        # releases and the dataset-unit rationale stay as METADATA on the
+        # parent product (never separate datasets)
+        "snapshot": {
+            "stableIdentifier": stable_id,
+            "category": record.get("category"),
+            "categoryIds": _str_list(record.get("category_ids")),
+            "modalityLabel": record.get("modality"),
+            "fieldCount": _ukb_int(record.get("field_count")),
+            "bulkFieldCount": _ukb_int(record.get("bulk_field_count")),
+            "derivedFieldCount": _ukb_int(record.get("derived_field_count")),
+            "participantCount": participant_count,
+            "childDataFieldIds": _str_list(record.get("child_data_field_ids")),
+            "accessLevel": record.get("access_level"),
+            "classification": record.get("classification"),
+            "datasetUnitRationale": record.get("dataset_unit_rationale"),
+            "metadataNote": record.get("metadata_note"),
+            "versionReleaseInformation": record.get("version_release_information"),
+            "exclusionReason": record.get("exclusion_reason"),
+        },
+        "datasetSizeBytes": None,
+        # official UK Biobank Showcase product page — verbatim census URL; the
+        # deterministic sourceDatasetId/sourceKeys, not the URL, are identity.
+        "documentationUrl": doc_url,
+        # publication information — a census publication DOI (if present) is
+        # relationship metadata ONLY, quarantined from identity (canonical doi
+        # stays null).
+        "publication": {
+            "publishDate": None,
+            "articleDoi": publication_doi,
+            "relatedIdentifiers": (
+                [{"identifier": publication_doi}] if publication_doi else []
+            ),
+            "funding": [],
+        },
+        # explicit per-field provenance bookkeeping
+        "provenance": {
+            "source": UKB_REPOSITORY,
+            "sourceApi": "biobank.ndph.ox.ac.uk Showcase census artifact 2026-08-17",
+            "retrievedAt": _utcnow(),
+            "direct": [
+                "name", "description", "category", "category_ids", "modality",
+                "source_url", "access_level", "field_count", "bulk_field_count",
+                "derived_field_count", "participant_count", "child_data_field_ids",
+                "classification", "dataset_unit_rationale", "metadata_note",
+                "version_release_information", "exclusion_reason", "publication_doi",
+            ],
+            "derived": list(derived.keys()),
+        },
+        # derived summary (explicit direct-vs-derived split, spec §2)
+        "derived": derived,
+        # untouched UK Biobank census-artifact record — preserved verbatim (spec §11)
         "rawMetadata": record,
     }
     return source
