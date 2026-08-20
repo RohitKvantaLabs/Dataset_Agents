@@ -34,25 +34,44 @@ class QueryUnderstandingAgent:
 
     def parse(self, raw_query: str) -> QueryFilters:
         raw_query = raw_query.strip()
+        
+        # Log the attempt to understand query
+        logger.debug("QueryUnderstandingAgent parsing query: %r", raw_query)
+        
         if self._llm is None:
+            logger.warning("LLMClient not available, falling back to heuristic parsing")
             return self._heuristic_parse(raw_query)
 
         try:
+            # Log the model being used for parsing
+            logger.debug("Using Groq model for query parsing: %s", self._llm._model)
             parsed = self._llm.generate_json(
                 system_prompt=QUERY_UNDERSTANDING_SYSTEM_PROMPT,
                 user_prompt=query_understanding_user_prompt(raw_query),
                 max_tokens=500,
             )
-            return QueryFilters(raw_query=raw_query, **parsed)
+            
+            # Log successful parsing with extracted fields for debugging
+            logger.debug("Query parsing successful. Extracted fields: %s", {
+                "modality": parsed.get("modality", []),
+                "condition": parsed.get("condition", []),
+                "species": parsed.get("species", []),
+                "region": parsed.get("region"),
+                "task": parsed.get("task"),
+                "format": parsed.get("format", []),
+                "age_range": parsed.get("age_range"),
+                "keywords": parsed.get("keywords", [])
+            })
+            
+            result = QueryFilters(raw_query=raw_query, **parsed)
+            return result
         except (LLMJSONParseError, TypeError, ValueError) as exc:
-            logger.warning("Query parsing fell back to heuristic mode: %s", exc)
+            logger.error("Query parsing failed with LLM error: %s", exc)
+            logger.error("QueryUnderstandingAgent falling back to heuristic parsing")
             return self._heuristic_parse(raw_query)
         except (GroqAPIError, CircuitBreakerOpenError) as exc:
-            logger.warning(
-                "Query parsing fell back to keyword-only filters due to NETWORK failure "
-                "(LLM endpoint unreachable or circuit open — not a malformed-response error): %s",
-                exc,
-            )
+            logger.error("Groq API error during query parsing: %s (type: %s)", exc, type(exc).__name__)
+            logger.error("QueryUnderstandingAgent falling back to keyword-only filters due to API failure")
             return QueryFilters(raw_query=raw_query, keywords=raw_query.split())
 
     def _heuristic_parse(self, raw_query: str) -> QueryFilters:

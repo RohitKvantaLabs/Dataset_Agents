@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str
 
     # Model for Phase-1 Query Understanding Agent (structured JSON extraction
-    # from natural language). Llama 3.1 8B Instant is fast and reliable for
-    # structured JSON output via Groq's JSON mode.
-    GROQ_QUERY_MODEL: str = "llama-3.1-8b-instant"
+    # from natural language). openai/gpt-oss-120b — verified available with
+    # Groq JSON mode support on the current key.
+    GROQ_QUERY_MODEL: str = "openai/gpt-oss-120b"
 
     # Model for the Fallback / Discovery Agent (open-ended reasoning, URL
     # candidate generation). Llama 3.3 70B Versatile excels at long-context
