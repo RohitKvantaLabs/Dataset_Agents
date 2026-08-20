@@ -63,7 +63,12 @@ class QueryUnderstandingAgent:
                 "keywords": parsed.get("keywords", [])
             })
             
-            result = QueryFilters(raw_query=raw_query, **parsed)
+            has_signal = bool(
+                parsed.get("modality") or parsed.get("condition") or parsed.get("task")
+                or parsed.get("region") or parsed.get("species") or parsed.get("age_range")
+                or parsed.get("format")
+            )
+            result = QueryFilters(raw_query=raw_query, in_domain=has_signal, **parsed)
             return result
         except (LLMJSONParseError, TypeError, ValueError) as exc:
             logger.error("Query parsing failed with LLM error: %s", exc)
@@ -116,6 +121,7 @@ class QueryUnderstandingAgent:
         elif "working memory" in text:
             task = "working memory"
 
+        has_signal = bool(modalities or condition or task or region or species or age_range or formats)
         return QueryFilters(
             raw_query=raw_query,
             modality=modalities,
@@ -125,5 +131,5 @@ class QueryUnderstandingAgent:
             condition=condition,
             task=task,
             format=formats,
-            is_bids_compliant=True if "bids" in formats else None,
+            in_domain=has_signal,
         )

@@ -17,6 +17,10 @@ class QueryFilters(BaseModel):
     format: list[str] = Field(default_factory=list)          # e.g. ["NIfTI", "BIDS"]
     keywords: list[str] = Field(default_factory=list)        # free-text fallback terms
     raw_query: str
+    # ponytail: domain guard — False means no neuroscience signal was found; Node
+    # must stop retrieval immediately. Defaults True so keyword-only fallback
+    # (API down) never incorrectly blocks legitimate queries.
+    in_domain: bool = True
 
 
 class ParseQueryRequest(BaseModel):
