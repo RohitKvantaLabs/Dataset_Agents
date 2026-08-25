@@ -11,6 +11,7 @@ out/
 
 # Logs and runtime files
 logs/
+
 *.log
 
 # Python cache and environments
