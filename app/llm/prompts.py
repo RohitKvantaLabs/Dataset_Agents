@@ -23,9 +23,14 @@ CANONICALIZATION RULES (always normalize to these forms, never invent new spelli
 - species: lowercase singular — "human", "mouse", "rat", "macaque", "marmoset". \
   Assume "human" only if the query explicitly names a human population (e.g. "patients", "children", \
   "adults"); do not default to "human" for a species-agnostic query — leave the array empty instead.
-- age_range: one of "pediatric" (age < 18), "adult" (18-65), "geriatric" (65+), or an explicit numeric \
-  range "X-Y" if given in the query. Map "kids"/"children"/"infants"/"adolescents"→"pediatric"; \
-  "elderly"/"older adults"→"geriatric".
+- age_range: one of "infant", "child", "adolescent", "adult", "elderly" (the exact labels dataset \
+  metadata uses), or an explicit numeric range "X-Y" if exact ages are given in the query. Map \
+  synonyms onto these labels: "kid"/"kids"/"child"/"children"/"pediatric"→"child"; \
+  "teen"/"teenager"/"teenagers"/"adolescent"/"adolescents"/"youth"→"adolescent"; \
+  "adult"/"adults"→"adult"; "elderly"/"older adults"/"geriatric"→"elderly"; \
+  "infant"/"infants"/"newborn"/"newborns"→"infant". If the query names multiple distinct age \
+  groups (e.g. "children and adults"), set age_range to null rather than choosing one — a single \
+  string cannot represent several groups.
 - region: lowercase anatomical region name — "hippocampus", "amygdala", "cerebellum", "thalamus", \
   "striatum", "prefrontal cortex", "motor cortex", "visual cortex", "brainstem", "basal ganglia", \
   "insula", "caudate", "putamen", "cingulate", "corpus callosum", "hypothalamus". Extract only \
@@ -55,7 +60,7 @@ STRICTNESS:
 EXAMPLES:
 
 Query: "resting state fMRI in the hippocampus of kids with ADHD, BIDS format"
-{"modality": ["fMRI"], "species": [], "age_range": "pediatric", "region": "hippocampus", "condition": ["ADHD"], \
+{"modality": ["fMRI"], "species": [], "age_range": "child", "region": "hippocampus", "condition": ["ADHD"], \
 "task": "resting-state", "format": ["BIDS"], "keywords": []}
 
 Query: "EEG datasets from healthy adult macaques, no seizure history"

@@ -156,7 +156,7 @@ Expected response shape (matches `NODE_INTEGRATION_CONTRACT.md §1`):
   "filters": {
     "modality": ["fmri"],
     "species": [],
-    "age_range": "pediatric",
+    "age_range": "child",
     "condition": ["adhd"],
     "task": "resting-state",
     "format": [],
@@ -184,7 +184,7 @@ curl -X POST http://localhost:8000/api/v1/agents/fallback-search \
     "query_id": "sess_test01",
     "query": "resting state fMRI in kids with ADHD",
     "filters": {
-      "modality": ["fmri"], "species": [], "age_range": "pediatric",
+      "modality": ["fmri"], "species": [], "age_range": "child",
       "condition": ["adhd"], "task": "resting-state", "format": [],
       "keywords": [], "raw_query": "resting state fMRI in kids with ADHD"
     }

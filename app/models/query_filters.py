@@ -10,7 +10,7 @@ class QueryFilters(BaseModel):
     """
     modality: list[str] = Field(default_factory=list)      # e.g. ["fMRI", "EEG"]
     species: list[str] = Field(default_factory=list)        # e.g. ["human"]
-    age_range: str | None = None                            # e.g. "pediatric", "0-12"
+    age_range: str | None = None                            # canonical AGE_TERMS label ("child", "adolescent", …) or numeric "0-12"
     region: str | None = None                               # e.g. "hippocampus", "amygdala"
     condition: list[str] = Field(default_factory=list)      # e.g. ["ADHD"]
     task: str | None = None                                  # e.g. "resting-state"

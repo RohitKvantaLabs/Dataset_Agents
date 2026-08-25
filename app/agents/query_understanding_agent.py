@@ -94,10 +94,21 @@ class QueryUnderstandingAgent:
                 break
 
         age_range = None
+        # Canonical labels mirror AGE_TERMS (app/data/vocab.py) — the same
+        # vocabulary the ingestion pipeline writes into dataset age_group
+        # metadata, so intent, facets and conflict detection share one concept
+        # space ("children"/"pediatric" → "child", never a separate token).
         if any(term in text for term in ["kid", "child", "children", "pediatric", "under 12"]):
-            age_range = "pediatric"
+            age_range = "child"
+        elif any(term in text for term in ["adolescent", "teenager", "teenagers", "youth"]):
+            age_range = "adolescent"
         elif any(term in text for term in ["adult", "adults"]):
             age_range = "adult"
+        elif any(term in text for term in ["elderly", "geriatric", "older adults"]):
+            age_range = "elderly"
+        elif any(term in text for term in ["infant", "infants", "newborn", "newborns",
+                                           "neonatal", "neonates"]):
+            age_range = "infant"
 
         region = None
         for candidate in ["hippocampus", "amygdala", "cerebellum", "thalamus", "striatum",

@@ -28,6 +28,9 @@ from app.models.query_filters import QueryFilters
 def _make_agent_with_mock_llm(generate_json_side_effect=None, generate_json_return=None) -> tuple[QueryUnderstandingAgent, MagicMock]:
     """Return (agent, mock_llm) with generate_json pre-configured."""
     mock_llm = MagicMock(spec=LLMClient)
+    # parse() logs self._llm._model at debug level; spec'd MagicMock rejects
+    # private attributes unless explicitly set (pre-existing suite failure).
+    mock_llm._model = "mock-model"
     if generate_json_side_effect is not None:
         mock_llm.generate_json.side_effect = generate_json_side_effect
     else:
@@ -151,9 +154,32 @@ class TestHeuristicParser:
         result = self._parse("fMRI dataset")
         assert result.species == []
 
-    def test_age_range_pediatric(self) -> None:
-        result = self._parse("fMRI in kids")
-        assert result.age_range == "pediatric"
+    def test_age_range_child_canonical(self) -> None:
+        """All child-equivalent forms collapse onto the canonical label "child"
+        (mirrors AGE_TERMS), never a separate token like "pediatric"."""
+        for query in ["fMRI in kids", "fMRI in children", "fMRI in child patients",
+                      "pediatric fMRI dataset"]:
+            result = self._parse(query)
+            assert result.age_range == "child", f"{query!r} → {result.age_range}"
+
+    def test_age_range_adolescent(self) -> None:
+        """Adolescent forms stay distinct from child — never collapsed together."""
+        for query in ["fMRI in adolescents", "fMRI in teenagers", "youth EEG dataset"]:
+            result = self._parse(query)
+            assert result.age_range == "adolescent", f"{query!r} → {result.age_range}"
+
+    def test_age_range_adult_plural(self) -> None:
+        result = self._parse("fMRI in adults")
+        assert result.age_range == "adult"
+
+    def test_age_range_infant(self) -> None:
+        result = self._parse("EEG in newborns")
+        assert result.age_range == "infant"
+
+    def test_age_range_child_takes_precedence_over_adult(self) -> None:
+        """Existing branch precedence preserved: child terms win over adult."""
+        result = self._parse("children and adults fMRI")
+        assert result.age_range == "child"
 
     def test_age_range_adult(self) -> None:
         result = self._parse("adult healthy controls")
@@ -183,7 +209,7 @@ class TestLLMHappyPath:
         llm_output = {
             "modality": ["fMRI"],
             "species": ["human"],
-            "age_range": "pediatric",
+            "age_range": "child",
             "condition": ["ADHD"],
             "task": "resting-state",
             "format": [],
@@ -194,8 +220,35 @@ class TestLLMHappyPath:
 
         assert result.modality == ["fMRI"]
         assert result.species == ["human"]
-        assert result.age_range == "pediatric"
+        assert result.age_range == "child"
         assert result.condition == ["ADHD"]
         assert result.task == "resting-state"
         assert result.raw_query == "resting state fMRI ADHD kids"
         mock_llm.generate_json.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Canonical age vocabulary contract (FR: query intent ↔ filter vocabulary)
+# ---------------------------------------------------------------------------
+
+class TestCanonicalAgeVocabularyContract:
+    """
+    The prompt must emit the dataset-metadata age labels (AGE_TERMS), not a
+    parallel vocabulary. Regression guard for the false-conflict bug where the
+    parser emitted "pediatric" while facets expose "Child".
+    """
+
+    def test_prompt_uses_canonical_age_labels(self) -> None:
+        from app.llm.prompts import QUERY_UNDERSTANDING_SYSTEM_PROMPT
+
+        assert '"child"' in QUERY_UNDERSTANDING_SYSTEM_PROMPT
+        assert '"adolescent"' in QUERY_UNDERSTANDING_SYSTEM_PROMPT
+        assert '"adult"' in QUERY_UNDERSTANDING_SYSTEM_PROMPT
+
+    def test_prompt_no_longer_mandates_pediatric_as_canonical(self) -> None:
+        from app.llm.prompts import QUERY_UNDERSTANDING_SYSTEM_PROMPT
+
+        # "pediatric" may appear only as an input synonym to be mapped onto
+        # "child", never as an emitted canonical value.
+        assert '→"pediatric"' not in QUERY_UNDERSTANDING_SYSTEM_PROMPT
+        assert '"pediatric" (age < 18)' not in QUERY_UNDERSTANDING_SYSTEM_PROMPT

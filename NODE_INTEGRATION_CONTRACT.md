@@ -19,7 +19,7 @@ All requests require header: `X-Internal-Secret: <INTERNAL_API_SECRET>`
   "filters": {
     "modality": ["fMRI"],
     "species": ["human"],
-    "age_range": "pediatric",
+    "age_range": "child",
     "condition": ["ADHD"],
     "task": "resting-state",
     "format": [],
