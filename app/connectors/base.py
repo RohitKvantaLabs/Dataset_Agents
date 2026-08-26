@@ -152,7 +152,7 @@ class TokenBucket:
 MODALITY_SYNONYMS: dict[str, frozenset[str]] = {
     "fmri": frozenset({"fmri", "mri", "functional mri", "functional magnetic resonance imaging"}),
     "smri": frozenset({"smri", "mri", "structural mri", "structural magnetic resonance imaging"}),
-    "mri": frozenset({"mri", "fmri", "smri", "functional mri", "structural mri"}),
+    "mri": frozenset({"mri", "fmri", "smri", "functional mri", "structural mri", "functional nuclear magnetic resonance", "functional nuclear magnetic resonance imaging"}),
     "eeg": frozenset({"eeg", "electroencephalography"}),
     "meg": frozenset({"meg", "magnetoencephalography"}),
     "ieeg": frozenset({"ieeg", "intracranial eeg", "ecog"}),

@@ -1,6 +1,10 @@
 """
 Controlled vocabularies + SPDX license map (§3.3, §4.8).
 
+Retrieval V2 addition: ``TASK_VOCAB`` gives ``task`` first-class metadata
+status with the same controlled-vocabulary contract as modality/species/age/
+disease (see Phase 1 of the Retrieval V2 design).
+
 Populated 2026-08-04 (query-first stabilization, Issue 3): repository
 candidates often declare ``modality = []`` while their title/description
 clearly describe MEG / MRI / EEG / fMRI / PET etc. Stage 3 of the quality
@@ -12,6 +16,7 @@ the pipeline degrades gracefully.
 Usage contract
 --------------
 - ``MODALITY_VOCAB``  ``dict[str, list[str]]``  label -> accepted raw tokens (lowercase)
+- ``TASK_VOCAB``      ``dict[str, list[str]]``  label -> accepted raw tokens (lowercase)
 - ``SPECIES_VOCAB``   ``dict[str, list[str]]``  label -> accepted raw tokens (lowercase)
 - ``REGION_TERMS``    ``list[str]``             accepted region tokens (lowercase)
 - ``AGE_TERMS``       ``dict[str, list[str]]``  label -> accepted raw tokens (lowercase)
@@ -24,6 +29,7 @@ Modality labels mirror the synonym families already approved in
 ``app.connectors.base.MODALITY_SYNONYMS`` (a token maps to the same label a
 synonym family would match).
 """
+import re
 
 # Modality label -> accepted raw tokens (lowercase). Mirrors the approved
 # MODALITY_SYNONYMS families in app/connectors/base.py.
@@ -32,7 +38,7 @@ MODALITY_VOCAB: dict[str, list[str]] = {
     "eeg": ["eeg", "electroencephalography", "electroencephalogram"],
     "ieeg": ["ieeg", "intracranial eeg", "intracranial electroencephalography"],
     "ecog": ["ecog", "electrocorticography"],
-    "mri": ["mri", "magnetic resonance imaging"],
+    "mri": ["mri", "magnetic resonance imaging", "functional nuclear magnetic resonance", "functional nuclear magnetic resonance imaging"],
     "fmri": ["fmri", "functional mri", "functional magnetic resonance imaging"],
     "smri": ["smri", "structural mri", "structural magnetic resonance imaging", "t1-weighted", "t2-weighted"],
     "pet": ["pet", "positron emission tomography"],
@@ -135,6 +141,107 @@ DISEASE_TERMS: dict[str, list[str]] = {
     "tinnitus": ["tinnitus"],
     "chronic pain": ["chronic pain", "neuropathic pain", "fibromyalgia"],
 }
+
+# Task label -> accepted raw tokens (lowercase).
+#
+# Retrieval V2 (Phase 1/2 — first-class task metadata): canonical task labels,
+# following the same label->tokens pattern as AGE_TERMS / DISEASE_TERMS. The
+# vocabulary reuses ONLY task concepts the system already recognizes elsewhere
+# (the query parser emits "resting-state" and "working memory"; the audit's
+# recognized concept list names resting-state, working-memory, motor,
+# attention, language). No unrelated taxonomy was invented.
+#
+# Canonical labels are HYPHENATED so a stored dataset.task and a parsed
+# filters.task normalize to one token space ("working memory" →
+# "working-memory"). Tokens are deliberately conservative: bare "motor" /
+# "attention" are NOT tokens because they collide with region/anatomy prose
+# ("motor cortex", "attention skills"); only unambiguous paradigm phrases
+# match. Unknown/missing stays null — never guessed (Phase 2 rule 6-8).
+TASK_VOCAB: dict[str, list[str]] = {
+    "resting-state": [
+        "resting state",
+        "resting-state",
+        "resting state fmri",
+        "resting-state fmri",
+        "rs-fmri",
+        "resting state functional mri",
+    ],
+    "working-memory": [
+        "working memory",
+        "working-memory",
+    ],
+    "motor": [
+        "motor task",
+        "motor imagery",
+        "motor learning",
+        "finger tapping",
+    ],
+    "attention": [
+        "attention task",
+        "sustained attention",
+        "selective attention",
+        "divided attention",
+        "visual attention",
+        "attention network test",
+    ],
+    "language": [
+        "language task",
+        "language processing",
+        "speech production",
+        "sentence comprehension",
+    ],
+}
+
+# Flat index: every raw token -> its canonical task label (built once).
+_TASK_TOKEN_INDEX: dict[str, str] = {
+    token: label for label, tokens in TASK_VOCAB.items() for token in tokens
+}
+
+
+def match_task_labels(text: str) -> list[str]:
+    """All canonical task labels whose tokens appear (word-boundary) in *text*.
+
+    Deterministic vocabulary matching — the exact mechanism Stage 3 already
+    uses for region/age/disease (_match_vocab_token). Multiple labels can
+    match multi-paradigm descriptions; callers take evidence confidence order.
+    """
+    found: list[str] = []
+    for label, tokens in TASK_VOCAB.items():
+        for token in tokens:
+            t = token.strip().lower()
+            if t and re.search(rf"\b{re.escape(t)}\b", text or ""):
+                found.append(label)
+                break
+    return found
+
+
+def normalize_task_label(value: str | None) -> str | None:
+    """Normalize a free-form task string onto the canonical TASK_VOCAB label.
+
+    Handles common variants where the existing vocabulary supports them:
+      "Resting state" / "resting-state fMRI" / "rs-fMRI" -> "resting-state"
+      "Working Memory" / "working-memory task"          -> "working-memory"
+
+    Returns None when *value* is empty or maps to no known label — unknown
+    stays unknown instead of being fabricated into a near-miss label.
+    """
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if not v:
+        return None
+    if v in _TASK_TOKEN_INDEX:
+        return _TASK_TOKEN_INDEX[v]
+    # Direct canonical-label hit (already normalized input).
+    if v in TASK_VOCAB:
+        return v
+    # Variant forms: try token containment against the vocabulary index so
+    # e.g. "resting state fmri session" still resolves to "resting-state".
+    for token, label in _TASK_TOKEN_INDEX.items():
+        if re.search(rf"\b{re.escape(token)}\b", v):
+            return label
+    return None
+
 
 # Unimplemented — pending approved SPDX license map. Connector-declared
 # license strings are preserved unchanged.

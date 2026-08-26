@@ -36,6 +36,12 @@ class Dataset(BaseModel):
     region: str | None = None
     age_group: str | None = None
     disease: str | None = None
+    # Retrieval V2 Phase 1 — task is first-class metadata. Value is a canonical
+    # TASK_VOCAB label (app/data/vocab.py, e.g. "resting-state",
+    # "working-memory") or None when the dataset's own evidence does not
+    # support one. NEVER populated from a user query; null means UNKNOWN in
+    # retrieval/ranking, not mismatch.
+    task: str | None = None
     access_tier: str | None = None          # 'open' | 'registered' | 'restricted' | None
     doi: str | None = None
     size_label: str | None = None

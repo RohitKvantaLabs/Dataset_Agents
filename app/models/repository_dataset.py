@@ -53,6 +53,9 @@ class RepositoryDataset(BaseModel):
     region: str | None = None
     age_group: str | None = None
     disease: str | None = None
+    # Retrieval V2 Phase 1 — canonical TASK_VOCAB label populated by Stage 3
+    # enrichment from dataset-owned evidence only; None stays None.
+    task: str | None = None
     files: list[RepositoryFile] = Field(default_factory=list)
     is_direct_link: bool = False
     raw: dict = Field(default_factory=dict)  # full upstream record (provenance/debug)

@@ -43,6 +43,9 @@ from app.data.vocab import (
     MODALITY_VOCAB,
     REGION_TERMS,
     SPECIES_VOCAB,
+    TASK_VOCAB,
+    match_task_labels,
+    normalize_task_label,
 )
 from app.db.repositories.dataset_repository import (
     bulk_upsert,
@@ -809,6 +812,38 @@ async def _stage_enrich(records: list[_Record], settings) -> tuple[list[_Record]
                 rec.enrichment_sources.append("vocab_disease")
                 rec.enrichment["disease_source"] = src
 
+        # 5b) Task (Retrieval V2 Phase 2) — same evidence hierarchy as the
+        #     fields above: repository JSON metadata (95) > title (90) >
+        #     keywords (85) > description (40). Evidence is ALWAYS
+        #     dataset-owned (source metadata / title / keywords /
+        #     description); user queries never reach this code path. Labels
+        #     normalize onto the canonical TASK_VOCAB vocabulary; when no
+        #     vocabulary token matches, task stays None — never guessed.
+        if not c.task:
+            json_task_labels: list[str] = []
+            raw_meta = c.raw.get("metadata") if isinstance(c.raw, dict) else None
+            if isinstance(raw_meta, dict):
+                declared = raw_meta.get("tasks") or raw_meta.get("task")
+                if isinstance(declared, str):
+                    declared = [declared]
+                if isinstance(declared, list):
+                    for item in declared:
+                        label = normalize_task_label(str(item or ""))
+                        if label and label not in json_task_labels:
+                            json_task_labels.append(label)
+            evidence = [("json", json_task_labels)]
+            evidence += [
+                (name, match_task_labels(text)) for name, text in text_sources
+            ]
+            value, src = _first_vocab_evidence(evidence)
+            if value:
+                # ``value`` may hold several labels for multi-paradigm text;
+                # ``task`` is a single canonical string (mirrors disease), so
+                # keep the highest-priority label from the ordered vocabulary.
+                c.task = value[0] if isinstance(value, list) else value
+                rec.enrichment_sources.append("vocab_task")
+                rec.enrichment["task_source"] = src
+
         # 6) Modality / species fill — exact vocab match only when empty, with
         #     the full confidence hierarchy: repository JSON metadata (95) > title
         #     (90) > keywords (85) > description (40). Modality text evidence is
@@ -1031,6 +1066,7 @@ def _to_dataset(rec: _Record) -> Dataset | None:
             region=c.region,
             age_group=c.age_group,
             disease=c.disease,
+            task=c.task,
             access_tier=c.access_tier,
             doi=c.doi,
             size_label=c.size_label,
@@ -1049,7 +1085,7 @@ def _extended_quality_bonus(rec: _Record, cap: float) -> float:
     c = rec.candidate
     filled = sum(
         1
-        for v in (c.region, c.age_group, c.disease, c.doi, c.access_tier, c.size_label)
+        for v in (c.region, c.age_group, c.disease, c.task, c.doi, c.access_tier, c.size_label)
         if v
     )
     return round(min(float(cap), 0.04 * filled), 4)

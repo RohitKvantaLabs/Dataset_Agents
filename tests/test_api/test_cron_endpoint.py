@@ -36,11 +36,11 @@ def test_reverify_links_with_correct_auth_returns_counts(
     with (
         patch("app.api.v1.cron.find_datasets_for_reverification", new=AsyncMock(return_value=datasets)),
         patch("app.api.v1.cron.VerificationAgent", return_value=verifier),
-        patch("app.api.v1.cron.update_verification_status", new=update_status),
+        patch("app.api.v1.cron.bulk_update_verification_status", new=update_status),
     ):
         response = client.get("/api/v1/cron/reverify-links", headers=cron_headers)
 
     assert response.status_code == 200
-    assert response.json() == {"checked": 2, "verified": 1, "stale": 1}
+    assert response.json() == {"checked": 2, "verified": 1, "stale": 1, "errors": 0}
     assert verifier.revalidate.await_count == 2
-    assert update_status.await_count == 2
+    assert update_status.await_count == 1
