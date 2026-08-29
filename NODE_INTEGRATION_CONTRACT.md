@@ -1,5 +1,6 @@
 # Node <-> Python Agent Service Contract
 
+
 All requests require header: `X-Internal-Secret: <INTERNAL_API_SECRET>`
 (shared secret, set in both services' env vars - not the same as any user-facing auth).
 
