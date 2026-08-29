@@ -76,8 +76,8 @@ class QueryUnderstandingAgent:
             return self._heuristic_parse(raw_query)
         except (GroqAPIError, CircuitBreakerOpenError) as exc:
             logger.error("Groq API error during query parsing: %s (type: %s)", exc, type(exc).__name__)
-            logger.error("QueryUnderstandingAgent falling back to keyword-only filters due to API failure")
-            return QueryFilters(raw_query=raw_query, keywords=raw_query.split())
+            logger.error("QueryUnderstandingAgent falling back to heuristic parsing due to API failure")
+            return self._heuristic_parse(raw_query)
 
     def _heuristic_parse(self, raw_query: str) -> QueryFilters:
         text = raw_query.lower()

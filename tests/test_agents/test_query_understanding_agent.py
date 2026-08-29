@@ -95,12 +95,12 @@ class TestJsonParseFailureFallback:
 class TestNetworkFailureFallback:
     """
     When the LLM endpoint is unreachable (network error, timeout, HTTP error),
-    parse() must return keyword-only QueryFilters, not propagate the exception
+    parse() must return heuristic QueryFilters, not propagate the exception
     as a 500.
     """
 
-    def test_groq_api_error_returns_keyword_only_filters(self) -> None:
-        """GroqAPIError (base class for all Groq API errors) → keyword-only fallback."""
+    def test_groq_api_error_falls_back_to_heuristic(self) -> None:
+        """GroqAPIError (base class for all Groq API errors) → heuristic fallback."""
         import httpx as _httpx
         mock_request = _httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
         agent, _ = _make_agent_with_mock_llm(
@@ -110,9 +110,22 @@ class TestNetworkFailureFallback:
 
         assert isinstance(result, QueryFilters)
         assert result.raw_query == "resting state fMRI ADHD"
-        # keyword-only path: keywords come from split(), heuristic fields are absent
-        assert result.keywords == ["resting", "state", "fMRI", "ADHD"]
-        assert result.modality == []
+        # Heuristic fallback path: modality and condition recovered
+        assert "fmri" in result.modality
+        assert "adhd" in result.condition
+        assert result.task == "resting-state"
+
+    def test_groq_api_error_recovers_alzheimer_condition(self) -> None:
+        """Query 'Alzheimer's disease longitudinal neuroimaging' recovers 'alzheimer' condition on GroqAPIError."""
+        import httpx as _httpx
+        mock_request = _httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        agent, _ = _make_agent_with_mock_llm(
+            generate_json_side_effect=GroqAPIError("JSON validation failed", request=mock_request, body=None)
+        )
+        result = agent.parse("Alzheimer's disease longitudinal neuroimaging")
+
+        assert isinstance(result, QueryFilters)
+        assert "alzheimer" in result.condition
 
     def test_unexpected_exception_still_propagates(self) -> None:
         """A non-network, non-parse exception must NOT be swallowed — it should 500."""
