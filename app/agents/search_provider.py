@@ -38,6 +38,9 @@ class NullSearchProvider(SearchProvider):
     """Safe default: returns no results rather than pretending to search.
     Useful in tests / local dev without a Tavily key."""
 
+    def __init__(self):
+        self._last_external_call = None
+
     async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
         return []
 
@@ -55,6 +58,7 @@ class TavilySearchProvider(SearchProvider):
         self._api_key = settings.TAVILY_API_KEY
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT_SECONDS)
+        self._last_external_call: dict | None = None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6), reraise=True)
     async def _call_tavily(self, query: str, max_results: int) -> dict:
@@ -72,15 +76,46 @@ class TavilySearchProvider(SearchProvider):
         return response.json()
 
     async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        import time
+        start = time.monotonic()
+        self._last_external_call = None
         try:
             # Circuit breaker wraps the ENTIRE retry-attempt call so that a
             # known-down Tavily is fast-failed without exhausting 3 retries.
             async with _tavily_circuit_breaker:
                 data = await self._call_tavily(query, max_results)
+            duration = int((time.monotonic() - start) * 1000)
+            self._last_external_call = {
+                "service": "tavily",
+                "operation": "search",
+                "endpoint": TAVILY_SEARCH_URL,
+                "durationMs": duration,
+                "status": "success",
+                "httpStatus": 200,
+                "error": None,
+            }
         except (httpx.HTTPError, CircuitBreakerOpenError) as exc:
             # Search failing should degrade the Fallback Agent to LLM-only
             # candidates, not crash the whole fallback-search request.
             logger.warning("Tavily search failed for %r: %s", query, exc)
+            duration = int((time.monotonic() - start) * 1000)
+            http_status = None
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                try:
+                    http_status = exc.response.status_code
+                except Exception:
+                    http_status = None
+            elif isinstance(exc, CircuitBreakerOpenError):
+                http_status = None
+            self._last_external_call = {
+                "service": "tavily",
+                "operation": "search",
+                "endpoint": TAVILY_SEARCH_URL,
+                "durationMs": duration,
+                "status": "error",
+                "httpStatus": http_status,
+                "error": str(exc)[:500],
+            }
             return []
         finally:
             if self._owns_client:

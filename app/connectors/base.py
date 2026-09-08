@@ -56,6 +56,8 @@ class SearchResult(BaseModel):
     # reason" requirement (e.g. EBRAINS key missing, connector failure).
     status: str = "ok"                # "ok" | "offline"
     error: str | None = None          # reason when status == "offline"
+    httpStatus: int | None = None     # HTTP status of last upstream call (Phase 5)
+    endpoint: str | None = None       # endpoint identifier (Phase 5)
 
 
 def _is_transient(exc: BaseException) -> bool:

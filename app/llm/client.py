@@ -32,10 +32,12 @@ class LLMClient:
         settings = get_settings()
         self._model = model or settings.GROQ_QUERY_MODEL
         self._client = Groq(api_key=settings.GROQ_API_KEY)
+        self._last_usage: dict | None = None
+        self._last_model: str | None = None
         logger.debug("LLMClient initialised with model=%s", self._model)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8), reraise=True)
-    def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 512, response_format: dict | None = None) -> str:
+    def _chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 512, response_format: dict | None = None) -> tuple[str, dict | None]:
         kwargs = {
             "model": self._model,
             "messages": [
@@ -48,7 +50,22 @@ class LLMClient:
         if response_format:
             kwargs["response_format"] = response_format
         response = self._client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content
+        usage = None
+        try:
+            u = getattr(response, "usage", None)
+            if u is not None:
+                usage = {
+                    "prompt_tokens": getattr(u, "prompt_tokens", None),
+                    "completion_tokens": getattr(u, "completion_tokens", None),
+                    "total_tokens": getattr(u, "total_tokens", None),
+                    "model": getattr(response, "model", self._model) or self._model,
+                }
+        except Exception:
+            usage = None
+        # Store last usage for callers that use generate_json without capturing return
+        self._last_usage = usage
+        self._last_model = getattr(response, "model", self._model) or self._model
+        return response.choices[0].message.content, usage
 
     def generate_json(self, system_prompt: str, user_prompt: str, max_tokens: int = 512) -> dict:
         """
@@ -58,9 +75,18 @@ class LLMClient:
 
         Circuit breaker wraps the ENTIRE call (including tenacity retries)
         so that a known-down LLM is fast-failed without exhausting retries.
+        Returns parsed JSON. Usage available via generate_json_with_usage or last_usage.
+        """
+        parsed, _ = self.generate_json_with_usage(system_prompt, user_prompt, max_tokens)
+        return parsed
+
+    def generate_json_with_usage(self, system_prompt: str, user_prompt: str, max_tokens: int = 512) -> tuple[dict, dict | None]:
+        """
+        Same as generate_json but also returns provider-reported usage.
+        Returns (parsed_json, usage_dict|None). Usage contains prompt_tokens, completion_tokens, total_tokens, model.
         """
         with _llm_circuit_breaker:
-            raw = self._chat(
+            raw, usage = self._chat(
                 system_prompt,
                 user_prompt,
                 max_tokens=max_tokens,
@@ -68,7 +94,16 @@ class LLMClient:
             )
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             logger.error("LLM returned non-JSON output: %s", raw[:500])
             raise LLMJSONParseError(f"Could not parse LLM output as JSON: {exc}") from exc
+        return parsed, usage
+
+    @property
+    def last_usage(self) -> dict | None:
+        return getattr(self, "_last_usage", None)
+
+    @property
+    def last_model(self) -> str | None:
+        return getattr(self, "_last_model", None)

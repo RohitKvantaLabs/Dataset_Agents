@@ -20,6 +20,8 @@ class QueryUnderstandingAgent:
     def __init__(self, llm_client: LLMClient | None = None):
         self._provider = "heuristic"
         self._llm = llm_client
+        self._last_usage: dict | None = None
+        self._last_model_used: str | None = None
         if self._llm is None:
             try:
                 settings = get_settings()
@@ -32,6 +34,14 @@ class QueryUnderstandingAgent:
     def provider(self) -> str:
         return self._provider
 
+    @property
+    def last_usage(self) -> dict | None:
+        return getattr(self, "_last_usage", None)
+
+    @property
+    def last_model_used(self) -> str | None:
+        return getattr(self, "_last_model_used", None)
+
     def parse(self, raw_query: str) -> QueryFilters:
         raw_query = raw_query.strip()
         
@@ -40,16 +50,21 @@ class QueryUnderstandingAgent:
         
         if self._llm is None:
             logger.warning("LLMClient not available, falling back to heuristic parsing")
+            self._last_usage = None
+            self._last_model_used = None
             return self._heuristic_parse(raw_query)
 
         try:
             # Log the model being used for parsing
             logger.debug("Using Groq model for query parsing: %s", self._llm._model)
-            parsed = self._llm.generate_json(
+            parsed, usage = self._llm.generate_json_with_usage(
                 system_prompt=QUERY_UNDERSTANDING_SYSTEM_PROMPT,
                 user_prompt=query_understanding_user_prompt(raw_query),
                 max_tokens=500,
             )
+            # Store usage for API layer to read without changing return type
+            self._last_usage = usage
+            self._last_model_used = usage.get("model") if usage else self._llm._model
             
             # Log successful parsing with extracted fields for debugging
             logger.debug("Query parsing successful. Extracted fields: %s", {
@@ -73,10 +88,14 @@ class QueryUnderstandingAgent:
         except (LLMJSONParseError, TypeError, ValueError) as exc:
             logger.error("Query parsing failed with LLM error: %s", exc)
             logger.error("QueryUnderstandingAgent falling back to heuristic parsing")
+            self._last_usage = None
+            self._last_model_used = None
             return self._heuristic_parse(raw_query)
         except (GroqAPIError, CircuitBreakerOpenError) as exc:
             logger.error("Groq API error during query parsing: %s (type: %s)", exc, type(exc).__name__)
             logger.error("QueryUnderstandingAgent falling back to heuristic parsing due to API failure")
+            self._last_usage = None
+            self._last_model_used = None
             return self._heuristic_parse(raw_query)
 
     def _heuristic_parse(self, raw_query: str) -> QueryFilters:

@@ -27,5 +27,16 @@ class ParseQueryRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=500)
 
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    model: str | None = None
+    provider: str | None = None
+
+
 class ParseQueryResponse(BaseModel):
     filters: QueryFilters
+    usage: UsageInfo | None = None
+    model: str | None = None
+    provider: str | None = None

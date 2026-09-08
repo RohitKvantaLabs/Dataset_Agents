@@ -32,24 +32,45 @@ class FallbackAgent:
             settings = get_settings()
             self._llm = LLMClient(model=settings.GROQ_FALLBACK_MODEL)
         self._search = search_provider or NullSearchProvider()
+        self._last_usage: dict | None = None
+        self._last_model_used: str | None = None
+
+    @property
+    def last_usage(self) -> dict | None:
+        return self._last_usage
+
+    @property
+    def last_model_used(self) -> str | None:
+        return self._last_model_used
+
+    @property
+    def last_external_calls(self) -> list[dict]:
+        call = getattr(self, "_last_tavily_call", None)
+        return [call] if call else []
 
     async def discover(self, filters: QueryFilters, max_candidates: int = 10) -> list[FallbackCandidate]:
         # ponytail: append filetype hint for Tavily; raw_query stays clean for the LLM prompt.
         _SEARCH_HINT = "filetype:nii OR filetype:edf OR BIDS dataset download"
         search_query = f"{filters.raw_query} {_SEARCH_HINT}"
         web_hits = await self._search.search(search_query, max_results=max_candidates)
+        # Phase 5: capture Tavily external call telemetry for Node persistence
+        self._last_tavily_call = getattr(self._search, "_last_external_call", None)
 
         try:
-            llm_candidates = self._llm.generate_json(
+            llm_candidates, usage = self._llm.generate_json_with_usage(
                 system_prompt=FALLBACK_DISCOVERY_SYSTEM_PROMPT.format(max_candidates=max_candidates),
                 user_prompt=fallback_discovery_user_prompt(
                     filters.raw_query, json.dumps(filters.model_dump())
                 ),
                 max_tokens=800,
             )
+            self._last_usage = usage
+            self._last_model_used = usage.get("model") if usage else self._llm._model
         except Exception as exc:
             logger.warning("Fallback LLM discovery failed for %r: %s", filters.raw_query, exc)
             llm_candidates = []
+            self._last_usage = None
+            self._last_model_used = None
 
         if not isinstance(llm_candidates, list):
             llm_candidates = []

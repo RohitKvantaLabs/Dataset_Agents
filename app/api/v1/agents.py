@@ -2,7 +2,7 @@ import hashlib
 import logging
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 
 from app.agents.fallback_agent import FallbackAgent, FallbackCandidate
 from app.agents.query_understanding_agent import QueryUnderstandingAgent
@@ -30,17 +30,35 @@ _PARSE_CACHE_TTL = 300  # seconds
 #    it queries Mongo itself.
 # ---------------------------------------------------------------------
 @router.post("/agents/parse-query", response_model=ParseQueryResponse)
-async def parse_query(payload: ParseQueryRequest):
+async def parse_query(
+    payload: ParseQueryRequest,
+    x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+):
     now = time.time()
     cached = _parse_cache.get(payload.query)
     if cached and now - cached[1] < _PARSE_CACHE_TTL:
-        logger.info("parse_query cache hit for query=%r", payload.query)
+        logger.info("parse_query cache hit for query=%r request_id=%s", payload.query, x_request_id)
         return ParseQueryResponse(filters=cached[0])
 
     agent = QueryUnderstandingAgent()
     filters = agent.parse(payload.query)
+    usage = getattr(agent, "last_usage", None)
+    # Heuristic fallback produces no usage
+    usage_info = None
+    model_used = getattr(agent, "last_model_used", None)
+    provider_used = getattr(agent, "provider", None)
+    if usage and usage.get("prompt_tokens") is not None:
+        usage_info = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "model": usage.get("model") or model_used,
+            "provider": provider_used,
+        }
+    if x_request_id:
+        logger.info("parse_query request_id=%s query=%r usage=%s model=%s", x_request_id, payload.query, usage_info, model_used)
     _parse_cache[payload.query] = (filters, now)
-    return ParseQueryResponse(filters=filters)
+    return ParseQueryResponse(filters=filters, usage=usage_info, model=model_used, provider=provider_used)
 
 
 # ---------------------------------------------------------------------
@@ -63,6 +81,10 @@ class FallbackSearchResponse(BaseModel):
     datasets_found: int
     published: bool
     datasets: list[Dataset]
+    usage: dict | None = None
+    model: str | None = None
+    provider: str | None = None
+    external_calls: list[dict] | None = None
 
 
 def _web_candidate_to_repository_dataset(
@@ -110,12 +132,28 @@ def _web_candidate_to_repository_dataset(
 
 
 @router.post("/agents/fallback-search", response_model=FallbackSearchResponse)
-async def fallback_search(payload: FallbackSearchRequest):
+async def fallback_search(
+    payload: FallbackSearchRequest,
+    x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+):
+    if x_request_id:
+        logger.info("fallback_search request_id=%s query_id=%s query=%r", x_request_id, payload.query_id, payload.query)
     settings = get_settings()
     filters = QueryFilters.model_validate({**payload.filters, "raw_query": payload.query})
 
     fallback_agent = FallbackAgent(search_provider=TavilySearchProvider())
     candidates = await fallback_agent.discover(filters, max_candidates=settings.MAX_FALLBACK_CANDIDATES)
+    fb_usage = getattr(fallback_agent, "last_usage", None)
+    fb_usage_info = None
+    fb_model = getattr(fallback_agent, "last_model_used", None)
+    if fb_usage and fb_usage.get("prompt_tokens") is not None:
+        fb_usage_info = {
+            "prompt_tokens": fb_usage.get("prompt_tokens"),
+            "completion_tokens": fb_usage.get("completion_tokens"),
+            "total_tokens": fb_usage.get("total_tokens"),
+            "model": fb_usage.get("model") or fb_model,
+            "provider": "groq",
+        }
 
     # One quality path (§3.0): web candidates run the SAME 7-stage quality
     # pipeline as repository candidates. Stage 1 allows web-origin records
@@ -144,9 +182,14 @@ async def fallback_search(payload: FallbackSearchRequest):
         },
     )
 
+    external_calls = getattr(fallback_agent, "last_external_calls", []) or []
     return FallbackSearchResponse(
         query_id=payload.query_id,
         datasets_found=len(datasets),
         published=True,
         datasets=datasets,
+        usage=fb_usage_info,
+        model=fb_model,
+        provider="groq" if fb_usage_info else None,
+        external_calls=external_calls if external_calls else None,
     )

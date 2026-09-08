@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 
 from app.config import get_settings
 from app.core.security import require_cron_secret, require_internal_secret
@@ -55,6 +55,7 @@ class RepositorySearchResponse(BaseModel):
     total_found: int
     elapsed_ms: int
     datasets: list[Dataset]
+    external_calls: list[dict] | None = None
 
 
 @router.post(
@@ -62,7 +63,10 @@ class RepositorySearchResponse(BaseModel):
     response_model=RepositorySearchResponse,
     dependencies=[Depends(require_internal_secret)],
 )
-async def repository_search(payload: RepositorySearchRequest) -> RepositorySearchResponse:
+async def repository_search(
+    payload: RepositorySearchRequest,
+    x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+) -> RepositorySearchResponse:
     """
     Run enabled connectors in parallel → aggregate → quality pipeline
     stages 1–7 (publish) → re-query Mongo → return canonical documents.
@@ -81,6 +85,8 @@ async def repository_search(payload: RepositorySearchRequest) -> RepositorySearc
     before the response is returned, so any immediate re-query (here or on
     the Node side) observes the writes.
     """
+    if x_request_id:
+        logger.info("repository_search request_id=%s query=%r", x_request_id, payload.query)
     settings = get_settings()
     filters = QueryFilters.model_validate({**payload.filters, "raw_query": payload.query})
 
@@ -122,12 +128,26 @@ async def repository_search(payload: RepositorySearchRequest) -> RepositorySearc
             len(identities),
         )
 
+    # Phase 5: build per-service external call telemetry
+    external_calls = []
+    for src, res in aggregate.per_source.items():
+        external_calls.append({
+            "service": src,
+            "operation": "search",
+            "endpoint": getattr(res, "endpoint", None) or f"{src} search",
+            "durationMs": getattr(res, "elapsed_ms", 0),
+            "status": "success" if getattr(res, "status", "ok") == "ok" else "error",
+            "httpStatus": getattr(res, "httpStatus", None),
+            "error": getattr(res, "error", None),
+        })
+
     return RepositorySearchResponse(
         query_id=uuid.uuid4().hex,
         sources_queried=aggregate.sources_queried,
         total_found=len(datasets),
         elapsed_ms=pipeline.elapsed_ms,
         datasets=datasets,
+        external_calls=external_calls,
     )
 
 
